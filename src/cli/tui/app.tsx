@@ -4,6 +4,7 @@ import TextInput from 'ink-text-input';
 
 import { Api } from './api.ts';
 import { openStream, type StreamHandle } from './stream.ts';
+import { herdrState, reportHerdr } from './herdr.ts';
 import { openActivityStream } from './activity-stream.ts';
 import { matchCommands, runCommand } from './commands.ts';
 import { Header } from './header.tsx';
@@ -186,6 +187,11 @@ export function App({
         /* server unreachable — keep the previous counters */
       });
   }
+  useEffect(() => {
+    const current = work?.agent === agent && work.session === session ? work : null;
+    const state = herdrState(connected && current !== null, openQuestion !== null, busy || streaming, current);
+    reportHerdr(agent, session, state, `${agent}:${session}${state === 'unknown' ? ' · synchronizing / disconnected' : ''}`);
+  }, [agent, session, connected, openQuestion, busy, streaming, work]);
   useEffect(() => {
     showMemoryRef.current = showMemory;
   }, [showMemory]);
@@ -417,6 +423,8 @@ export function App({
   useEffect(() => {
     let cancelled = false;
     setTurns([]);
+    setStreaming(false);
+    setBusy(false);
     setStats(null);
     setNextModel(null);
     refreshNextModel(agent, session);
@@ -475,6 +483,7 @@ export function App({
         apiRef.current.streamUrl(agent, session),
         (text, tone) => {
           if (cancelled) return;
+          setConnected(false);
           appendTurn({ kind: 'system', id: nextId(), text, tone });
         },
       );
@@ -483,6 +492,11 @@ export function App({
         for await (const ev of stream.events) {
           if (cancelled) break;
           applyEvent(ev);
+          if (ev.kind === 'connected') {
+            void apiRef.current.fetchSessionQuestion(agent, session).then((q) => {
+              if (!cancelled) setOpenQuestion(q);
+            }).catch(() => {});
+          }
         }
       })().catch(() => {
         /* iterator close — nothing to do */
@@ -670,6 +684,7 @@ export function App({
     switch (ev.kind) {
       case 'connected':
         setConnected(true);
+        refreshWork(agent, session);
         return;
       case 'session-model':
         refreshNextModel(agent, session);
