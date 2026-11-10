@@ -26,6 +26,7 @@ export type CommandAction =
   | { kind: 'switchTo'; agent: string; session: string }
   | { kind: 'exit' }
   | { kind: 'clearStats' }
+  | { kind: 'clearQuestion' }
   | { kind: 'setShow'; target: ShowTarget; value: boolean }
   | { kind: 'setVerbose'; target: VerboseTarget; value: boolean }
   // Project focus changed locally — App can refresh its project state
@@ -440,6 +441,7 @@ export async function runCommand(
               `\n             current session is now empty + clean.${dreamLine}`,
             tone: 'info',
           });
+          out.push({ kind: 'clearQuestion' });
         } else {
           out.push({
             kind: 'notice',

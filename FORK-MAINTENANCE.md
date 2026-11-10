@@ -92,7 +92,9 @@ Nur nach gesonderter Freigabe auf dem Zielhost:
 
 **Kein reguläres `somora update` für diese Installation:** Das folgt dem offiziellen npm-Paket und kann unseren Patch überschreiben. Der Updateweg ist Original-Release → Update-PR → geprüfter Fork-Release → freigegebene Installation. Auto-Update-Jobs auf dem Zielhost dürfen nicht auf das Original zeigen.
 
-Bekannte offene Punkte: alte Rückfrage nach `/reset`, vollständiger Restore-Test, Verlust der selbst gemeldeten Statusanmeldung bei Herdr-Live-Handoff. Die letzten beiden betreffen auch unseren separaten privaten Herdr-Fork; beide Repos unabhängig versionieren und die konkret getestete Kombination in den Release Notes festhalten.
+Der Reset-Fix in diesem Quellstand entfernt nach tatsächlich erfolgtem `/reset YES` die alte Frage aus der TUI. Eine inzwischen neu eingegangene Frage bleibt erhalten; Vorschau, fehlgeschlagener Reset und No-op löschen keine Frage. Der Server archiviert die Frage bereits mit den alten Session-Metadaten. Bereits installierte Releases ohne diesen Fix benötigen weiterhin einen TUI-Neustart als Workaround.
+
+Weiter offen: vollständiger Restore-Test und Qualifikation der selbst gemeldeten Statusanmeldung bei Herdr-Live-Handoff (separater Herdr-Fix erforderlich). Die letzten beiden betreffen auch unseren separaten privaten Herdr-Fork; beide Repos unabhängig versionieren und die konkret getestete Kombination in den Release Notes festhalten.
 
 ## GitHub-Einstellungen
 
