@@ -38,6 +38,17 @@ test('a reset archive of main comes back as a normal session with the name its i
   assert.equal((await s.getHistory(agent, archiveId))[0]?.kind, 'user_message', 'history intact');
 });
 
+test('reset keeps the old question in the archive, not in the fresh session', async () => {
+  const id = await s.createSession(agent, 'question-reset');
+  await say(id, 'please ask me');
+  const question = { id: 'old-question', question: 'Keep this?', options: [] };
+  await s.sessionMetaStore.update(agent, id, (meta) => ({ ...meta, openQuestion: question }));
+  const result = await s.resetSession(agent, id);
+  assert.ok(result);
+  assert.equal((await s.sessionMetaStore.get(agent, id)).openQuestion, undefined);
+  assert.deepEqual((await s.sessionMetaStore.get(agent, result.archivedId)).openQuestion, question);
+});
+
 test('a reset archive of a named session does not take the fresh session\'s name', async () => {
   const id = await s.createSession(agent, 'trip');
   await say(id, 'packing list');
