@@ -9,6 +9,7 @@ permissions: {}
 
 jobs:
   discord:
+    if: github.repository == 'thenaxon/somora_agent'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:

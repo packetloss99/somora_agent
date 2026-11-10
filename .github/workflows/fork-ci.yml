@@ -1,0 +1,87 @@
+name: Somora fork CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      fork_revision:
+        description: "Fork revision for a manually approved release candidate (1, 2, ...)"
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: somora-fork-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-build:
+    name: somora-fork-check-build
+    if: github.repository == 'packetloss99/somora_agent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ONNXRUNTIME_NODE_INSTALL: skip
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.22.2
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+            web-mobile/package-lock.json
+      - name: Check release base and choose artifact version
+        id: identity
+        env:
+          FORK_REVISION: ${{ inputs.fork_revision }}
+        run: |
+          set -euo pipefail
+          base_commit=$(node -p 'require("./fork-upstream.json").commit')
+          git merge-base --is-ancestor "$base_commit" HEAD
+          base=$(node -p 'require("./package.json").version')
+          test "v$base" = "$(node -p 'require("./fork-upstream.json").tag')"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            test "$GITHUB_REF" = refs/heads/main
+            [[ "$FORK_REVISION" =~ ^[1-9][0-9]*$ ]]
+            revision="$FORK_REVISION"
+          else
+            revision="ci.${GITHUB_SHA:0:12}"
+          fi
+          echo "version=$base-somora.$revision" >> "$GITHUB_OUTPUT"
+      - name: Install dependencies with explicit npm 12 script policy
+        run: |
+          set -euo pipefail
+          for dir in . web web-mobile; do
+            (cd "$dir" && npm config set --location=project allow-scripts better-sqlite3,cpu-features,esbuild,fsevents,node-pty,onnxruntime-node,protobufjs,somora,ssh2)
+          done
+          npm ci
+      - name: Typecheck and test
+        run: npm run typecheck && npm test
+      - name: Build web clients and versioned package
+        env:
+          FORK_VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm version "$FORK_VERSION" --no-git-tag-version --ignore-scripts
+          mkdir -p fork-artifacts
+          npm pack --pack-destination fork-artifacts
+          printf 'repository=%s\ncommit=%s\nversion=%s\nrun=%s/%s/actions/runs/%s\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$FORK_VERSION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > fork-artifacts/BUILD-INFO.txt
+          cp fork-upstream.json fork-artifacts/
+          (cd fork-artifacts && sha256sum *.tgz BUILD-INFO.txt fork-upstream.json > SHA256SUMS)
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: somora-${{ steps.identity.outputs.version }}-linux-x86_64
+          path: fork-artifacts/
+          if-no-files-found: error
+          retention-days: 14
