@@ -74,8 +74,11 @@ jobs:
         run: |
           set -euo pipefail
           npm version "$FORK_VERSION" --no-git-tag-version --ignore-scripts
+          npm --prefix web run build
+          npm --prefix web-mobile run build
           mkdir -p fork-artifacts
-          npm pack --pack-destination fork-artifacts
+          # Dependencies are installed above; prepack would reinstall them through nested npm.
+          npm pack --ignore-scripts --pack-destination fork-artifacts
           printf 'repository=%s\ncommit=%s\nversion=%s\nrun=%s/%s/actions/runs/%s\n' \
             "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$FORK_VERSION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > fork-artifacts/BUILD-INFO.txt
           cp fork-upstream.json fork-artifacts/

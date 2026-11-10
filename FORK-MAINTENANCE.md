@@ -52,7 +52,8 @@ Unsere fachliche Abweichung ist die optionale Herdr-TUI-Anbindung: Status, Resum
 `.github/workflows/fork-ci.yml` läuft auf PRs und Pushes nach `main`; ein manueller Lauf ist nur auf `main` zulässig. Berechtigungen: `contents: read`, kein Deployment-/Publish-Token.
 
 - Node 24.22.2, Installation mit expliziter npm-12-Scriptfreigabe.
-- `npm run typecheck`, `npm test`, anschließend `npm pack` mit Build beider Webclients.
+- Dependencies in Root, `web` und `web-mobile` vor den Tests installieren; `ripgrep` für die Dateitests bereitstellen.
+- `npm run typecheck`, `npm test`, beide Webclients direkt bauen, anschließend `npm pack --ignore-scripts`. Der redundante `prepack`-Aufruf würde erneut verschachtelte `npm ci` starten und kann wegen npm 12s vererbter Scriptfreigabe scheitern; keine Tests oder eigentlichen Builds werden ausgelassen.
 - Linux-x86_64-Paket, `BUILD-INFO.txt`, `fork-upstream.json` und `SHA256SUMS` als Actions-Artefakt, 14 Tage Aufbewahrung.
 - Automatische Läufe: Version `<basis>-somora.ci.<commit>`; **keine freigegebenen Releases**.
 - Manueller Lauf mit `fork_revision=N`: Version `<basis>-somora.N`, beispielsweise `2026.1106.3-somora.1`. Paketversion und Lockfile werden nur im Build-Workspace entsprechend gesetzt.
