@@ -51,9 +51,9 @@ async function turn(
   agent: string,
   session: string,
   text: string,
-  opts: { store: ReturnType<typeof memStore>; signal?: AbortSignal; onPermission?: () => Promise<'allow' | 'deny'> },
+  opts: { store: ReturnType<typeof memStore>; signal?: AbortSignal; onPermission?: () => Promise<'allow' | 'deny'>; events?: NormalizedEvent[] },
 ): Promise<NormalizedEvent[]> {
-  const events: NormalizedEvent[] = [];
+  const events: NormalizedEvent[] = opts.events ?? [];
   for await (const ev of runExternalTurn({
     ext: getExternalAgent(agent, cfg)!,
     session,
@@ -92,14 +92,17 @@ test('the idle sweeper does not close a connection whose turn is still running, 
   assert.equal(open('patient'), 1, 'the connection is still open');
 });
 
-test('a streaming turn longer than idleMinutes is not cut off', async () => {
+test('a streaming turn longer than idleMinutes is not cut off', { timeout: 15_000 }, async (t) => {
   const cfg = config({ streamer: { command: cmd() } });
   const store = memStore();
   const ctl = new AbortController();
-  const running = turn(cfg, 'streamer', 's', 'be slow', { store, signal: ctl.signal });
-  await sleep(700);
+  t.after(() => { ctl.abort(); closeExternal('streamer', 's'); });
+  const events: NormalizedEvent[] = [];
+  const running = turn(cfg, 'streamer', 's', 'be slow', { store, signal: ctl.signal, events });
+  await waitFor(() => events.some((e) => e.kind === 'assistant_delta' && e.text.startsWith('0 1 ')), 'stream never produced its first chunks');
+  const beforeSweep = events.length;
   sweepExternal(0, Date.now() + 60 * 60_000);
-  await sleep(300);
+  await waitFor(() => events.slice(beforeSweep).some((e) => e.kind === 'assistant_delta'), 'stream did not continue after idle sweep');
   assert.equal(open('streamer'), 1, 'still open in the middle of the turn');
   ctl.abort();
   const evs = await running;
