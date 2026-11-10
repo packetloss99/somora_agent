@@ -12,8 +12,12 @@
 // Env: FAKE_AGENT_NAME (agentInfo.name), FAKE_NO_RESUME=1 (offer load only),
 //      FAKE_STDERR (written to stderr at start), FAKE_FAIL_INIT=1,
 //      FAKE_INIT_DELAY_MS / FAKE_SESSION_DELAY_MS (answer initialize /
-//      session/new that much later).
+//      session/new that much later); FAKE_SESSION_GATE_DIR signals
+//      session/new via a "started" file and waits for a "release" file.
 import { Readable, Writable } from 'node:stream';
+import { existsSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { AgentSideConnection, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
 
 if (process.env.FAKE_STDERR) process.stderr.write(process.env.FAKE_STDERR + '\n');
@@ -47,6 +51,10 @@ new AgentSideConnection((conn) => {
     },
     async authenticate() {},
     async newSession() {
+      if (process.env.FAKE_SESSION_GATE_DIR) {
+        await writeFile(join(process.env.FAKE_SESSION_GATE_DIR, 'started'), '');
+        while (!existsSync(join(process.env.FAKE_SESSION_GATE_DIR, 'release'))) await sleep(10);
+      }
       if (process.env.FAKE_SESSION_DELAY_MS) await sleep(Number(process.env.FAKE_SESSION_DELAY_MS));
       const id = `fake-${++n}-${process.pid}`;
       sessions.set(id, { memory: null, history: [] });

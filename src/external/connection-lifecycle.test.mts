@@ -8,17 +8,28 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { ConfigSchema, type Config } from '../config/types.ts';
 import { runExternalTurn } from '../engine/acp-external.ts';
 import type { SessionMetaStore } from '../engine/types.ts';
 import type { NormalizedEvent } from '../types/events.ts';
-import { closeAllExternal, connectionSnapshot, sweepExternal } from './connection.ts';
+import { closeAllExternal, closeExternal, connectionSnapshot, sweepExternal } from './connection.ts';
 import { getExternalAgent } from './registry.ts';
 
 const fake = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'fake-acp-agent.mjs');
 const cmd = (env = '') => `${env} ${JSON.stringify(process.execPath)} ${JSON.stringify(fake)}`.trim();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function waitFor(ready: () => boolean, message: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!ready()) {
+    assert.ok(Date.now() < deadline, message);
+    await sleep(10);
+  }
+}
 
 function config(agents: Record<string, { command: string }>): Config {
   return ConfigSchema.parse({ providers: {}, external: { systems: { lab: { transport: { local: true }, agents } } } });
@@ -40,9 +51,9 @@ async function turn(
   agent: string,
   session: string,
   text: string,
-  opts: { store: ReturnType<typeof memStore>; signal?: AbortSignal; onPermission?: () => Promise<'allow' | 'deny'> },
+  opts: { store: ReturnType<typeof memStore>; signal?: AbortSignal; onPermission?: () => Promise<'allow' | 'deny'>; events?: NormalizedEvent[] },
 ): Promise<NormalizedEvent[]> {
-  const events: NormalizedEvent[] = [];
+  const events: NormalizedEvent[] = opts.events ?? [];
   for await (const ev of runExternalTurn({
     ext: getExternalAgent(agent, cfg)!,
     session,
@@ -81,14 +92,17 @@ test('the idle sweeper does not close a connection whose turn is still running, 
   assert.equal(open('patient'), 1, 'the connection is still open');
 });
 
-test('a streaming turn longer than idleMinutes is not cut off', async () => {
+test('a streaming turn longer than idleMinutes is not cut off', { timeout: 15_000 }, async (t) => {
   const cfg = config({ streamer: { command: cmd() } });
   const store = memStore();
   const ctl = new AbortController();
-  const running = turn(cfg, 'streamer', 's', 'be slow', { store, signal: ctl.signal });
-  await sleep(700);
+  t.after(() => { ctl.abort(); closeExternal('streamer', 's'); });
+  const events: NormalizedEvent[] = [];
+  const running = turn(cfg, 'streamer', 's', 'be slow', { store, signal: ctl.signal, events });
+  await waitFor(() => events.some((e) => e.kind === 'assistant_delta' && e.text.startsWith('0 1 ')), 'stream never produced its first chunks');
+  const beforeSweep = events.length;
   sweepExternal(0, Date.now() + 60 * 60_000);
-  await sleep(300);
+  await waitFor(() => events.slice(beforeSweep).some((e) => e.kind === 'assistant_delta'), 'stream did not continue after idle sweep');
   assert.equal(open('streamer'), 1, 'still open in the middle of the turn');
   ctl.abort();
   const evs = await running;
@@ -124,21 +138,34 @@ test('Stop while the connection is still being opened: the turn ends as stopped 
   assert.equal(finalText(await turn(cfg, 'sleepy', 's', 'recall', { store })), 'you said nothing');
 });
 
-test('Stop while the agent sets up its session: the turn ends as stopped and no prompt is sent', async () => {
-  // FAKE_SESSION_DELAY_MS holds the answer to session/new.
-  const cfg = config({ slowsession: { command: cmd('FAKE_SESSION_DELAY_MS=1500') } });
+test('Stop while the agent sets up its session: the turn ends as stopped and no prompt is sent', { timeout: 15_000 }, async (t) => {
+  const gate = await mkdtemp(join(tmpdir(), 'somora-session-gate-'));
+  t.after(async () => {
+    closeExternal('slowsession', 's');
+    await rm(gate, { recursive: true, force: true });
+  });
+  // Initialization deliberately exceeds the old 400 ms abort timer. Wait for
+  // the actual session/new request, not an assumed process startup duration.
+  const cfg = config({ slowsession: { command: cmd(`FAKE_INIT_DELAY_MS=600 FAKE_SESSION_GATE_DIR=${JSON.stringify(gate)}`) } });
   const store = memStore();
   const ctl = new AbortController();
-  setTimeout(() => ctl.abort(), 400);
+  const running = turn(cfg, 'slowsession', 's', 'remember badger', { store, signal: ctl.signal });
+  await waitFor(() => existsSync(join(gate, 'started')), 'agent never reached session/new');
   const t0 = Date.now();
-  const evs = await turn(cfg, 'slowsession', 's', 'remember badger', { store, signal: ctl.signal });
+  ctl.abort();
+  const evs = await running;
   assert.ok(Date.now() - t0 < 1200, `the stop is not held up by the setup (${Date.now() - t0} ms)`);
   assert.equal(finalText(evs), '[somora] aborted by user');
   assert.ok(!evs.some((e) => e.kind === 'error'));
-  // The session that was being set up is kept for the next turn.
-  await sleep(1500);
-  assert.match(String(store.data.get('slowsession/s')?.externalSessionId), /^fake-/);
+  assert.equal(evs.at(-1)?.kind, 'turn_end');
+  assert.equal(store.data.get('slowsession/s')?.externalSessionId, undefined, 'setup is still held at the gate');
+  // Finish setup explicitly, then observe persistence rather than sleeping.
+  await writeFile(join(gate, 'release'), '');
+  await waitFor(() => typeof store.data.get('slowsession/s')?.externalSessionId === 'string', 'background setup never stored its session');
+  const sessionId = store.data.get('slowsession/s')?.externalSessionId;
+  assert.match(String(sessionId), /^fake-1-/);
   assert.equal(finalText(await turn(cfg, 'slowsession', 's', 'recall', { store })), 'you said nothing');
+  assert.equal(store.data.get('slowsession/s')?.externalSessionId, sessionId, 'the next turn reuses the completed setup');
 });
 
 test('a turn right after one stopped during setup uses the session that setup makes, not a second one', async () => {
