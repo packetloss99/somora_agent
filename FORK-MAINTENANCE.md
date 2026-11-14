@@ -18,7 +18,7 @@ Dieses Dokument ist die Arbeitsanweisung für Menschen und Coding-Agenten in **p
 
 Initiale Basis: **v2026.1106.3**, Commit `1feaad08c8077230c7af1b96050611592652579f`. Ein neuerer Git-Tag ist nicht automatisch ein veröffentlichter stabiler Release. GitHub Releases und npm prüfen.
 
-Unsere fachliche Abweichung ist die optionale Herdr-TUI-Anbindung: Status, Resume-Befehl, Exit-Freigabe und explizite Agent-/Session-Startargumente. Fork-Wartung bleibt eine eigene Änderung. Wird die Integration später upstream übernommen, unseren entsprechenden Patch entfernen, nicht doppelt pflegen.
+Unsere fachliche Abweichung ist die optionale Herdr-TUI-Anbindung: Status, Resume-Befehl, Exit-Freigabe und explizite Agent-/Session-Startargumente. Die TUI meldet den Anzeigenamen `<agent> · Somora` über Herdrs vorhandene Anzeige-Metadaten; technische Identität bleibt `somora-tui`/`somora`. Ein best-effort Refresh alle 30 Sekunden stellt die Anzeige nach Handoff wieder her und wiederholt fehlgeschlagene Meldungen. Beim regulären Exit und im synchronen Exit-Fallback wird die Anzeige vor der Agentfreigabe gelöscht. Ohne Herdr-Kontext gibt es weder Meldungen noch Refresh-Timer. Fork-Wartung bleibt eine eigene Änderung. Wird die Integration später upstream übernommen, unseren entsprechenden Patch entfernen, nicht doppelt pflegen.
 
 `origin` zeigt auf `https://github.com/packetloss99/somora_agent.git`, `upstream` auf `https://github.com/thenaxon/somora_agent.git`.
 
