@@ -2,6 +2,7 @@
 // (Subscription auth path). The provider config has no baseUrl/apiKey —
 // the binary at ~/.local/bin/claude already holds the user's session.
 
+import { envWithoutLoginKey } from '../server/env-file.ts';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -85,6 +86,16 @@ function createSteerableInput(first: SDKUserMessage): SteerableInput {
 }
 
 const ENGINE = 'claude-cli';
+
+/**
+ * `text` ended so that what follows starts a paragraph of its own: the
+ * text of a later request in the same turn reads as a new paragraph,
+ * not glued to the last word of the one before.
+ */
+export function endParagraph(text: string): string {
+  if (!text || text.endsWith('\n\n')) return text;
+  return text + (text.endsWith('\n') ? '\n' : '\n\n');
+}
 
 /** The text of a tool_result block's content, whatever shape it has. */
 function toolResultText(content: unknown): string {
@@ -254,6 +265,13 @@ export const claudeCliEngine: AgentEngine = {
     }
 
     let cumulative = '';
+    /** A new request began after text: its first text starts a paragraph. */
+    let paragraphNext = false;
+    const withParagraph = (text: string): string => {
+      if (!paragraphNext) return text;
+      paragraphNext = false;
+      return endParagraph(text);
+    };
     let finalText = '';
     let sawToolUse = false;
     let yieldedErrorEvent = false;
@@ -440,6 +458,11 @@ export const claudeCliEngine: AgentEngine = {
           model: resolvedModel.modelId,
           systemPrompt: systemPromptForTurn,
           settingSources: [],
+          // Everything Claude Code may need from somora.env
+          // (CLAUDE_CONFIG_DIR, an API key, a proxy), but not somora's
+          // login key. The MCP child's env, which rides on the command
+          // line, is secretFreeEnv (src/mcp/config.ts).
+          env: envWithoutLoginKey(),
           // claude-code 2.1.142+ surfaces MCP tools to the model only
           // when the meta-tool `ToolSearch` is among the enabled
           // built-ins — the SDK uses ToolSearch as the discovery
@@ -599,8 +622,10 @@ export const claudeCliEngine: AgentEngine = {
           // leaks — they're expected and add intentional surface. Proxy
           // children for external MCP servers register as
           // somora-<name>, so `mcp__somora-` covers the proxies.
+          // ToolSearch is enabled on purpose (the `tools` option above):
+          // it is how the model reaches somora's MCP tools, not a leak.
           const unexpectedTools = msg.tools.filter(
-            (t: string) => !t.startsWith(MCP_TOOL_PREFIX) && !t.startsWith('mcp__somora-'),
+            (t: string) => t !== 'ToolSearch' && !t.startsWith(MCP_TOOL_PREFIX) && !t.startsWith('mcp__somora-'),
           );
           if (unexpectedTools.length > 0 && !toolsLeakWarned) {
             logger.warn({
@@ -651,14 +676,15 @@ export const claudeCliEngine: AgentEngine = {
           const ev = msg.event;
           // A new request after a result: the SDK is answering the steers
           // that came in while the final answer was written.
-          if (ev.type === 'message_start' && resultsSeen > 0) {
-            unansweredSteers = 0;
-            // The steer's answer continues the same bubble: keep it a
-            // paragraph of its own instead of gluing it to the last word.
-            if (cumulative && !cumulative.endsWith('\n\n')) cumulative += cumulative.endsWith('\n') ? '\n' : '\n\n';
-          }
+          if (ev.type === 'message_start' && resultsSeen > 0) unansweredSteers = 0;
+          // Every request of the turn (after a tool result, or the
+          // answer to a steer) continues the same bubble: its text is a
+          // paragraph of its own instead of being glued to the last word
+          // ("…relative to workspace.In logs/app.log stehen…", measured
+          // 2026-11-09). Added only once the new request writes text.
+          if (ev.type === 'message_start' && cumulative) paragraphNext = true;
           if (ev.type === 'content_block_delta' && ev.delta.type === 'text_delta') {
-            cumulative += ev.delta.text;
+            cumulative = withParagraph(cumulative) + ev.delta.text;
             receivedTextViaStream = true;
             yield { kind: 'assistant_delta', ts: ts(), engine: ENGINE, text: cumulative };
           } else if (ev.type === 'content_block_delta' && ev.delta.type === 'thinking_delta') {
@@ -675,6 +701,8 @@ export const claudeCliEngine: AgentEngine = {
             lastCallContextTokens =
               (au.input_tokens ?? 0) + (au.cache_read_input_tokens ?? 0) + (au.cache_creation_input_tokens ?? 0);
           }
+          // Without a stream, each assistant message is one request.
+          if (!receivedTextViaStream && cumulative) paragraphNext = true;
           for (const block of msg.message.content) {
             if (block.type === 'thinking' && !receivedThinkingViaStream) {
               const t = (block as { thinking?: unknown }).thinking;
@@ -687,7 +715,7 @@ export const claudeCliEngine: AgentEngine = {
             } else if (block.type === 'redacted_thinking') {
               sawRedactedThinking = true;
             } else if (block.type === 'text' && !receivedTextViaStream) {
-              cumulative += block.text;
+              cumulative = withParagraph(cumulative) + block.text;
               yield { kind: 'assistant_delta', ts: ts(), engine: ENGINE, text: cumulative };
             } else if (block.type === 'tool_use') {
               // A tool is now running in the MCP child — relax the
@@ -939,12 +967,18 @@ export const claudeCliEngine: AgentEngine = {
         // so a concurrent /sessions stats-cache write (or activity mark)
         // can't revert sdkSessionId, and our write can't revert theirs
         // (Juni-Audit 2026-06).
+        // The mark moves only when this turn was answered here (text
+        // without a provider error, or a tool ran). A turn the provider
+        // ended before any answer (quota, an auth failure) leaves it, so
+        // the fallback's answer is caught up on next time (Fable review
+        // 2026-11-10 Nr. 5; grok-cli already did this).
+        const answeredHere = sawToolUse || (!yieldedErrorEvent && Boolean(finalText || cumulative));
         await metaStore.update(agent, session, (freshMeta) => ({
           ...freshMeta,
           engine: ENGINE,
           sdkSessionId: lastSdkSessionId,
           mcpServerName: MCP_SERVER_NAME,
-          engineLastSeen: withLastSeenTs(freshMeta, ENGINE, ts()),
+          ...(answeredHere ? { engineLastSeen: withLastSeenTs(freshMeta, ENGINE, ts()) } : {}),
         }));
       }
     } catch (err) {
@@ -1028,6 +1062,17 @@ export const claudeCliEngine: AgentEngine = {
     } finally {
       disarmIdleTimer();
       if (steerPoll) clearInterval(steerPoll);
+      // Messages pushed into the input but never confirmed by a further
+      // SDK message (the turn stopped or failed first): neither recorded
+      // nor answered. Back to the letterbox, so the next turn has them,
+      // as codex-cli and grok-cli do (Fable review 2026-11-10 Nr. 27).
+      if (input.steer && pendingSteerEvents.length > 0) {
+        const msgs = pendingSteerEvents.splice(0).flatMap((e) => (e.kind === 'steer_applied' ? e.messages : []));
+        if (msgs.length > 0) {
+          input.steer.requeue(msgs);
+          logger.info({ msg: 'engine.claude_steer_requeued', engine: ENGINE, agent, session, count: msgs.length });
+        }
+      }
       steerInput?.close();
       if (signal) signal.removeEventListener('abort', onUpstreamAbort);
     }
@@ -1078,6 +1123,7 @@ export async function compactClaudeSession(args: {
         model: resolvedModel.modelId,
         systemPrompt: args.systemPrompt,
         settingSources: [],
+        env: envWithoutLoginKey(),
         tools: ['ToolSearch'],
         disallowedTools: KNOWN_ACCOUNT_TOOLS,
         mcpServers: {

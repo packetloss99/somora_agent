@@ -39,7 +39,7 @@ window in the web client. Each tool has a switch there.
 ## The tool families
 
 Every tool carries a toolset tag. The tag groups tools for the
-per-agent switch (`toolset:<tag>`). There are 64 built-in tools, plus
+per-agent switch (`toolset:<tag>`). There are 66 built-in tools, plus
 whatever your external MCP servers bring.
 
 | Toolset | Tools | Offered when |
@@ -51,7 +51,7 @@ whatever your external MCP servers bring.
 | `web` | 2 | `web_fetch` always, `web_search` with `web.brave.apiKey` |
 | `file` | 6 | always, except `analyze_file` (see below) |
 | `exec` | 3 | always |
-| `agents` | 13 | always (`ask_user` only in a turn someone watches) |
+| `agents` | 14 | always (`ask_user` only in a turn someone watches) |
 | `skills` | 2 | always |
 | `sentinel` | 1 | always |
 | `projects` | 6 | `projects.enabled: true` |
@@ -60,7 +60,7 @@ whatever your external MCP servers bring.
 | `media` | 1 | image or video generation is set up |
 | `browser` | 1 | `browser.enabled: true` |
 | `decision` | 1 | `decisions.model` names an entry in `decisions.models` |
-| `builder` | 2 | builder agents only |
+| `builder` | 3 | builder agents only |
 | `mcp` | varies | servers listed under `mcp.servers` |
 
 ### Memory, docs and resources
@@ -145,12 +145,17 @@ Toolset `exec`.
 | `process` | Handles background jobs: `action` is `list`, `poll`, `log`, `write` or `kill`. |
 | `tmux` | Keeps terminal sessions open across turns: `action` is `create`, `send`, `capture`, `wait_idle`, `list` or `kill`, against `target: local` or an SSH resource. |
 
-Destructive command patterns are blocked. A resource can lift single
-blocks with `allowBlocked`, for a machine that belongs to the agent.
+Destructive command patterns are blocked in `exec` and in Sentinel
+check scripts. A resource can lift single blocks with `allowBlocked`,
+for a machine that belongs to the agent. `tmux send` is not filtered:
+it types into a program that is already running, often a prompt for
+another tool, where the same words are harmless text.
 
 Background jobs are detached: they survive a somora restart and are
 tracked on disk. `poll` checks the real process, never a remembered
-state.
+state. When somora runs as a systemd service, each background job, and
+a tmux server an agent starts, runs in a systemd scope of its own, so a
+restart or `somora update` does not end it.
 
 #### When a command times out
 
@@ -441,12 +446,19 @@ each with a short explanation. It can allow several answers at once
 appears as a card above the input in the web client and on the phone,
 and with numbered options in the TUI.
 
+When you are to approve or pick content, such as a text to post or
+send, drafts or a plan, the agent puts it in full into `details`. The
+card shows it above the options, as formatted text that scrolls on its
+own when long; the TUI prints it before the question. The agent's
+reply around the card may be out of view where you answer, the card
+never is.
+
 It is offered only while someone watches, and who that is decides
 whether the question waits:
 
 | Turn | The question |
 |---|---|
-| A chat agent's turn you started, typed or spoken | Does not wait. The agent's turn ends; the card stays until you answer, also after a reload or a restart. A click sends the option as your next message. Writing anything else in the chat answers it too. |
+| A chat agent's turn you started, typed or spoken | Does not wait. The agent's turn ends; the card stays until you answer, also after a reload or a restart. A click sends the option as your next message; while the agent is still working, the answer goes into its running turn, like a [steered](web.md) message, whatever the agent's `steering` setting says. Writing anything else in the chat answers it too. |
 | A chat agent working on a task another system sent over [A2A](a2a.md#taking-work-in) | Waits, and goes back to that system. |
 | A builder's turn while the session is attended (see [Builder agents](builder.md)) | Waits in the task panel. |
 | A turn from Sentinel, another agent or a sub-agent | Not offered: nobody would answer. |
@@ -464,9 +476,13 @@ when it is offered, not behind the tool search.
 Codex has a question tool of its own. Its questions arrive as the same
 card, without waiting; one card can then hold several questions, some
 answered in your own words. The answer goes out as one message with
-each question and its answer. This holds for a builder too: Codex has
-ended its turn when it asks, so its question is a card next to the
-task panel, while the builder's own `ask_user` still waits.
+each question and its answer.
+
+Codex often keeps working after it asks. An answer that comes while it
+does goes straight into that turn; it does not wait for the turn to
+end. This holds for a builder too:
+Codex's question is a card next to the task panel, while the builder's
+own `ask_user` still waits.
 
 ## How a tool reaches the model
 
@@ -579,6 +595,19 @@ their own limit, or take it from the call: `agent_ask` and
 `agentLoop.longTaskMaxTimeoutMs`. `exec` takes `timeout_ms`, up to one
 hour.
 
+**Several calls at once.** When a model asks for several tool calls in
+one reply on `openai-compatible`, the calls of tools that change
+nothing run at the same time: reading and listing files, searching
+memory and the web, fetching a page, reading docs and skills, and
+looking up projects, sessions, sub-agents and media. At most
+`agentLoop.maxParallelTools` run at once.
+
+Every other call runs alone: it waits for the calls before it, and the
+calls after it wait for it. The results go back in the order the model asked for them, so the
+model reads exactly what it would read with one call after another.
+Whether a model may ask for several calls at once is its
+`parallelToolCalls` setting (see [Models](models.md)).
+
 **Wrong input.** Input is checked against the tool's schema, and the
 error names the field. A nested object sent as a JSON string is read
 and accepted. An unknown tool name is answered with up to three similar
@@ -622,6 +651,8 @@ Settings that shape how tools run:
 | Setting | Default | Meaning |
 |---|---|---|
 | `agentLoop.toolCallTimeoutMs` | `30000` | Time limit of one tool call, unless the tool sets its own. |
+| `agentLoop.maxParallelTools` | `8` | Calls of one reply that run at the same time, for tools that change nothing. `1` runs them one after another. `openai-compatible` only. |
+| `agentLoop.parallelToolHint` | `false` | Tells a model with `parallelToolCalls: true` that independent calls can go in one reply. `openai-compatible` only. |
 | `agentLoop.longTaskMaxTimeoutMs` | `1800000` | Longest wait of the tools that wait for other work. |
 | `wiki.lucid.maxCallsPerTurn` | `3` | `wiki_*` calls per turn inside a review loop. |
 | `toolCatalog.alwaysVisible` | the list above | Tools kept in the model's list on `claude-cli`, `codex-cli` and `openai-compatible` instead of behind the tool search. Takes effect on the next turn. |

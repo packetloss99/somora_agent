@@ -209,7 +209,11 @@ them as the thinking block.
 ### Tools on Codex
 
 somora hands its tools to Codex as dynamic tools, so every Codex model
-reaches the same tools as on the other engines.
+reaches the same tools as on the other engines. Codex's own tools are
+off: its shell, web search, apps, plugins, image tools, and its `clock`
+and `sleep`. What the model has besides somora's tools is Code Mode's
+own `exec` and `wait`. A test checks this against the bundled Codex, so
+an update that brings a new tool of its own is caught before release.
 
 | Namespace | What is in it |
 |---|---|
@@ -255,6 +259,15 @@ providers:
 |---|---|---|---|
 | `grok-4.7` | 256000 | Thinking levels are passed as `--reasoning-effort`. `off` is sent as `low`, because the model always reasons. `reasoning.levels` is applied. Images go to Grok as images, PDFs as page images. | yes: chat, tools, thinking text, images and PDFs, steering, stop, `/compact`, model switch and back |
 
+**Tools on Grok.** The model has two tools of Grok's, `search_tool` and
+`use_tool`, and reaches only somora's tools through them. Grok's own
+built-ins (terminal, file edit, web search, its sub-agents and
+scheduler) are off. xAI account connectors that Grok would add from
+your account, such as `tasks` (automations) and `cursor` (your X
+account), are blocked in somora's Grok home. A connector a later Grok
+brings is logged (`engine.grok_foreign_mcp`) and blocked from the next
+turn on.
+
 Grok compacts its own conversation near the end of the window, and a
 row in the chat says so. `/compact` asks Grok to compact now. A Grok
 model can also be the worker for REM, Deep, Lucid and compaction: each
@@ -293,6 +306,7 @@ providers:
         maxTokens: 16384                  # operational output budget INCLUDING reasoning, not the model's max
         reasoning:
           levels: { "off": none, low: low, medium: high, high: max }
+        builder: { maxTokens: 65536, thinking: medium }   # builders write whole files and think before each
       - id: glm-5.3-flash                 # vLLM TP=4, native FP8; behind LiteLLM use the route name
         alias: glm
         contextWindow: 700000             # = --max-model-len (model-native 1M; 262k in the reference recipe)
@@ -597,7 +611,9 @@ providers:
 | `reasoning.param` | `reasoning_effort` | where the word goes: `reasoning_effort`, nested `reasoning` for OpenRouter, or `chat_template_kwargs` | not used | not used | not used |
 | `sampling` | unset | sent on every call, dropped once when the server rejects a key | not used | not used | not used |
 | `maxTokens` | unset, nothing sent | output cap on every call, dream and compaction workers included | not used | not used | not used |
-| `parallelToolCalls` | unset | unset or `false`: one tool call per round. `true` lets a model you trust call several tools at once. | not used | not used | not used |
+| `builder.maxTokens` | unset | replaces `maxTokens` when a [builder](builder.md) runs on this model | not used | not used | not used |
+| `builder.thinking` | unset | replaces `reasoning.default` for builders; an agent's or session's own level still wins | same | same | same |
+| `parallelToolCalls` | unset | unset or `false`: the model is asked for one tool call per round. `true` lets a model you trust call several tools at once; calls of tools that only read then run at the same time ([Tools](tools.md#results-limits-and-timeouts)). | not used | not used | not used |
 
 Keys allowed in `sampling`: `temperature`, `top_p`, `top_k`, `min_p`,
 `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `seed`,

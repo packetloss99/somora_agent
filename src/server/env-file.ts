@@ -22,7 +22,7 @@
 // provider, not an override. Matches the project's "config-and-file
 // give defaults, explicit env wins" policy (feedback_config_over_env).
 
-import { readFileSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -35,6 +35,86 @@ export interface LoadEnvFileResult {
   loaded: number;
   skipped: number;
   permissionWarning?: string;
+}
+
+/** Names this process took from somora.env — secrets by intent. A child
+ *  somora spawns with an `env` that ends up visible (the MCP tool child
+ *  of a claude-cli turn: its env rides on the Claude Code command line)
+ *  leaves them out and loads the file itself (secretFreeEnv below). */
+export const ENV_FILE_KEYS = new Set<string>();
+
+/**
+ * This process's environment without its secrets: the login key
+ * (SOMORA_KEY, set at run time from server.key) and every variable that
+ * came from somora.env. For a child whose environment is not private —
+ * Claude Code puts the MCP server config, env included, on its command
+ * line (`--mcp-config`), readable by anyone with `ps` (Fable review
+ * 2026-11-10). The child reads the key file and somora.env itself.
+ */
+export function secretFreeEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v !== 'string') continue;
+    if (k === 'SOMORA_KEY' || ENV_FILE_KEYS.has(k) || SECRET_NAME_RE.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/** Names that hold a secret by convention. A secret can reach the server
+ *  from more than somora.env — a systemd EnvironmentFile, the shell that
+ *  started it — so the visible env also drops these by name (on the live
+ *  instance GOG_KEYRING_PASSWORD came from the unit's EnvironmentFile and
+ *  still stood on Claude Code's command line). */
+export const SECRET_NAME_RE = /(KEY|TOKEN|SECRET|PASSW|CREDENTIAL|COOKIE|AUTH)/i;
+
+/**
+ * The full environment (minus the login key) for the MCP child, in a
+ * file only this user can read: `<SOMORA_HOME>/run/mcp-child-env.json`.
+ * The child's `env` rides on Claude Code's command line and keeps only
+ * secretFreeEnv(); the child merges this file at start
+ * (loadPrivateEnvFile), so exec and skills see what the server sees.
+ * Rewritten on every spawn, atomically; returns its path.
+ */
+export function writePrivateEnvFile(): string {
+  const dir = join(SOMORA_HOME, 'run');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  const file = join(dir, 'mcp-child-env.json');
+  const tmp = `${file}.${process.pid}.${Date.now().toString(36)}`;
+  writeFileSync(tmp, JSON.stringify(envWithoutLoginKey()), { mode: 0o600 });
+  renameSync(tmp, file);
+  return file;
+}
+
+/** Merge the private env file into process.env; what is set wins. */
+export function loadPrivateEnvFile(path: string | undefined = process.env.SOMORA_MCP_ENV_FILE): number {
+  if (!path) return 0;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  } catch {
+    return 0;
+  }
+  let n = 0;
+  for (const [k, v] of Object.entries(parsed)) {
+    if (typeof v === 'string' && process.env[k] === undefined && k !== 'SOMORA_KEY') {
+      process.env[k] = v;
+      n += 1;
+    }
+  }
+  return n;
+}
+
+/** This process's environment without the login key only — for a
+ *  program that may need what somora.env configures for it (Claude Code:
+ *  CLAUDE_CONFIG_DIR, an API key, a proxy) but has no use for somora's
+ *  own key. Its environment is private to this user; its command line
+ *  is not, which is why the MCP child gets secretFreeEnv instead. */
+export function envWithoutLoginKey(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) if (typeof v === 'string' && k !== 'SOMORA_KEY') out[k] = v;
+  return out;
 }
 
 export function loadSomoraEnvFile(path: string = DEFAULT_ENV_FILE): LoadEnvFileResult {
@@ -87,6 +167,7 @@ export function loadSomoraEnvFile(path: string = DEFAULT_ENV_FILE): LoadEnvFileR
       continue;
     }
     process.env[key] = value;
+    ENV_FILE_KEYS.add(key);
     loaded += 1;
   }
 

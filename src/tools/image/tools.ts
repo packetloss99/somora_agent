@@ -182,8 +182,10 @@ export const imageGenerate: ToolDefinition<GenerateArgs> = {
   },
   // Image models are slow by nature — a 2K render takes tens of seconds
   // and 4K can take minutes. The engine-level 30s default would cancel
-  // a request the provider is still billing for.
-  defaultTimeoutMs: 300_000,
+  // a request the provider is still billing for. Above the default job
+  // limit (imageGen.jobTimeoutMs, 15 min): at 5 min the tool was cut off
+  // while the job was still allowed to run (Fable review, docs vs code 13).
+  defaultTimeoutMs: 16 * 60_000,
   available: (ctx) => imageGenEnabled(ctx),
   async handler(input, ctx): Promise<GenerateOutput | MultimodalToolResult> {
     const cfg = ctx.config.imageGen;
@@ -406,6 +408,8 @@ export const imageList: ToolDefinition<ListArgs, ListOutput> = {
   // existed — and then returned videos, which a tool with that name has
   // no business doing.
   name: 'media_list',
+  // Changes nothing: may run beside other such calls of a round.
+  concurrent: true,
   // Its own toolset rather than `image`: a video-only install needs to
   // list what it made, and gating this on imageGen would have left it
   // with no way to.
@@ -503,6 +507,8 @@ interface ModelRow {
  */
 export const imageModels: ToolDefinition<ModelsArgs, { models: ModelRow[] }> = {
   name: 'image_models',
+  // Changes nothing: may run beside other such calls of a round.
+  concurrent: true,
   toolset: 'image',
   description:
     'List the configured image models for image_generate. Call this before generating when you ' +

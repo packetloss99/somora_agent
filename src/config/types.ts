@@ -124,6 +124,21 @@ export const ModelSchema = z.object({
    * on claude-cli / codex-cli. See docs/setup.md → Local OpenAI-compatible.
    */
   parallelToolCalls: z.boolean().optional(),
+  /**
+   * What a builder (agent.yaml `kind: builder`) gets on this model
+   * instead; chat agents keep the values above. `maxTokens` replaces the
+   * output cap, `thinking` the default thinking level (`reasoning.default`).
+   * A build writes whole files and thinks before each, so it wants a
+   * larger cap and more thinking than a chat answer (measured 2026-11-10,
+   * private/builder-research/2026-11-09_dsh-vs-somora).
+   */
+  builder: z
+    .object({
+      maxTokens: z.number().int().positive().optional(),
+      thinking: z.enum(['off', 'low', 'medium', 'high']).optional(),
+    })
+    .strict()
+    .optional(),
 });
 export type Model = z.infer<typeof ModelSchema>;
 
@@ -624,6 +639,22 @@ export const AgentLoopConfigSchema = z.object({
    */
   maxToolCallsPerTurn: z.number().int().positive().max(500).default(30),
   /**
+   * How many tool calls of one round run at the same time. Only tools
+   * that change nothing (`concurrent` on their definition: reads,
+   * searches, status lookups) run side by side; everything else runs
+   * alone, in the model's order (private/parallel-tools/KONZEPT.md).
+   * 1 runs every call one after another, as before 2026-11-09.
+   * Openai-compatible engine only.
+   */
+  maxParallelTools: z.number().int().min(1).max(32).default(8),
+  /**
+   * Tell a model that may call several tools at once (a model with
+   * `parallelToolCalls: true`) that independent calls can go in one
+   * reply. Off until the measurement in private/parallel-tools shows
+   * it helps without costing quality. Openai-compatible engine only.
+   */
+  parallelToolHint: z.boolean().default(false),
+  /**
    * Wall-clock cap for one turn of the openai-compatible loop, in ms.
    * Unset = no time cap (only rounds and calls bound the turn). A
    * builder agent sets this per agent (agent.yaml `agentLoop.maxTurnMs`,
@@ -710,6 +741,8 @@ export const AgentLoopConfigSchema = z.object({
 }).default({
   maxRounds: 8,
   maxToolCallsPerTurn: 30,
+  maxParallelTools: 8,
+  parallelToolHint: false,
   toolUsageReminder: true,
   toolCallTimeoutMs: 30_000,
   longTaskDefaultTimeoutMs: 300_000,
@@ -2814,6 +2847,23 @@ export interface ResolvedModel {
   provider: Provider;
   modelId: string;
   model: Model;
+}
+
+/**
+ * The model as an agent of this kind sees it: for a builder, the
+ * model's `builder:` values over its own. A chat agent, or a model
+ * without the block, gets it as is.
+ */
+export function modelForKind(resolved: ResolvedModel, kind: string | undefined): ResolvedModel {
+  const b = resolved.model.builder;
+  if (kind !== 'builder' || !b) return resolved;
+  const m = resolved.model;
+  const model: Model = {
+    ...m,
+    ...(b.maxTokens !== undefined ? { maxTokens: b.maxTokens } : {}),
+    ...(b.thinking ? { reasoning: { ...m.reasoning, default: b.thinking } } : {}),
+  };
+  return { ...resolved, model };
 }
 
 export function resolveModelRef(config: Config, ref: string): ResolvedModel | null {

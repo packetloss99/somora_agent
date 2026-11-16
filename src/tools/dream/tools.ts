@@ -64,6 +64,8 @@ const ListInput = z.object({
 
 export const dreamList: ToolDefinition<z.infer<typeof ListInput>> = {
   name: 'dream_list',
+  // Changes nothing: may run beside other such calls of a round.
+  concurrent: true,
   toolset: 'dream',
   description:
     'List pending dreams awaiting user review. Returns both per-agent memory dreams (REM phase: ' +
@@ -145,6 +147,8 @@ const GetInput = z.object({
 
 export const dreamGet: ToolDefinition<z.infer<typeof GetInput>> = {
   name: 'dream_get',
+  // Changes nothing: may run beside other such calls of a round.
+  concurrent: true,
   toolset: 'dream',
   description:
     'Fetch the full content of a dream — all findings with their proposed actions, reasons, and ' +
@@ -713,7 +717,7 @@ export const dreamRun: ToolDefinition<z.infer<typeof RunInput>> = {
           via: 'in-process',
         };
       }
-      return runLucidViaHttp(wait);
+      return runLucidViaHttp(wait, force);
     }
     // phase === 'deep'
     if (injectedDreamRunDeps) {
@@ -790,7 +794,7 @@ async function runDeepViaHttp(wait: boolean, force: boolean): Promise<unknown> {
   return { phase: 'deep', ...data, via: 'http' };
 }
 
-async function runLucidViaHttp(wait: boolean): Promise<unknown> {
+async function runLucidViaHttp(wait: boolean, force = false): Promise<unknown> {
   const host = process.env.SOMORA_HOST || '127.0.0.1';
   const port = process.env.SOMORA_PORT || '18737';
   const scheme = process.env.SOMORA_TLS === '1' ? 'https' : 'http';
@@ -798,7 +802,9 @@ async function runLucidViaHttp(wait: boolean): Promise<unknown> {
   const res = await loopbackFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ wait }),
+    // force too: the route reads it, and the HTTP path used to drop it
+    // (Fable review, docs vs code 14).
+    body: JSON.stringify({ wait, force }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');

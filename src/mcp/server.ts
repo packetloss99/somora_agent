@@ -30,6 +30,7 @@ import { alwaysVisibleTools } from '../tools/catalog.ts';
 import type { ToolDefinition } from '../tools/types.ts';
 import { loadPersona } from '../persona/loader.ts';
 import { logger } from '../server/logger.ts';
+import { loadPrivateEnvFile, loadSomoraEnvFile } from '../server/env-file.ts';
 import { isToolAllowed, sessionToolDeny, withSessionDeny } from '../tools/gating.ts';
 import { readBuilderState } from '../server/builder-session.ts';
 import { sessionToolAllows } from '../server/ask-attended.ts';
@@ -194,6 +195,14 @@ async function proxyMain(agent: string, proxyServer: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // The parent leaves somora.env's secrets out of this child's env (it
+  // rides on the Claude Code command line); exec and skills here need
+  // them, so read the file as the main server does. The login key comes
+  // from server.key (loopbackFetch).
+  // First the server's full environment from the private file (what is
+  // on the command line wins), then somora.env as the main server reads it.
+  loadPrivateEnvFile();
+  loadSomoraEnvFile();
   const agent = process.env.SOMORA_AGENT;
   if (!agent || !/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(agent)) {
     process.stderr.write(
@@ -334,6 +343,14 @@ async function main(): Promise<void> {
       name: tool.name,
       description: persona?.kind === 'builder' ? builderToolDescription(tool.name, tool.description) : tool.description,
       inputSchema: mcpAdvertisedSchema(tool),
+      // A tool that changes nothing (`concurrent: true`) says so: Claude
+      // Code runs calls of such tools of one reply side by side (its
+      // isConcurrencySafe is readOnlyHint), as the openai-compatible
+      // engine does (private/parallel-tools/KONZEPT.md §6). Our tool gate
+      // allows every somora tool anyway, so the hint changes no
+      // permission. A classifier that depends on the input cannot be
+      // said in MCP; such tools stay unmarked.
+      ...(tool.concurrent === true ? { annotations: { readOnlyHint: true } } : {}),
       ...(alwaysLoad.has(tool.name) ? { _meta: { 'anthropic/alwaysLoad': true } } : {}),
     })),
   }));
