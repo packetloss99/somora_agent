@@ -53,7 +53,8 @@ import { formatSampling, isSamplingParamError, samplingBody } from './sampling.t
 import { insideOpenThink, splitInlineThink } from './inline-think.ts';
 import { imageOriginalNotes } from '../multimodal/attachment-note.ts';
 import { DEFAULT_ALWAYS_VISIBLE } from '../tools/catalog.ts';
-import { explainInvalidInput, planCatalog, routeCall, runToolSearch, TOOL_CALL, TOOL_SEARCH } from './openai-tool-catalog.ts';
+import { explainInvalidInput, planCatalog, routeCall, runToolSearch, TOOL_CALL, TOOL_SEARCH, type CallRoute } from './openai-tool-catalog.ts';
+import { createLimiter, runsConcurrently } from './tool-concurrency.ts';
 
 const ENGINE = 'openai-compatible';
 
@@ -65,9 +66,6 @@ const MAX_ARG_REROLLS = 2;
 // cut off while thinking (the output cap; routers do not say so). It gets
 // this many nudges per turn before the empty answer stands.
 const MAX_REASONING_ONLY_NUDGES = 2;
-// A builder that has not touched its task list for this many tool rounds
-// while items are open is reminded (the person watches that list).
-const TODO_STALE_ROUNDS = 12;
 /** Rounds of a builder turn kept verbatim when it compacts itself. */
 const MIDTURN_KEEP_ROUNDS = 6;
 // A builder answer cut off by the output cap is continued at most this
@@ -79,6 +77,11 @@ const MAX_CUT_ANSWER_CONTINUES = 2;
 // the Zod schema and defaults itself.
 const DEFAULT_MAX_TOOL_ROUNDS = 8;
 const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 30;
+
+/** agentLoop.parallelToolHint: said only to a model that may call
+ *  several tools at once (parallelToolCalls: true). */
+export const PARALLEL_TOOL_HINT =
+  'Tool calls that do not depend on each other — several files to read, several searches — can go in one reply: they run at the same time. Calls that need an earlier result still go one after another.';
 const DEFAULT_TOOL_CALL_TIMEOUT_MS = 30_000;
 
 type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -287,19 +290,31 @@ export function buildPartialDigest(messages: readonly ChatMessage[]): string {
  * aren't the known scaffold string (weak models loop on all sorts of
  * phrases). Cheap and bounded: only looks once the text is long enough to
  * be suspicious, and by then the stream is cut so `text` never grows huge.
+ *
+ * A loop repeats back to back: the last four occurrences of a probe from
+ * the tail must be separated by the same text each time. A long piece
+ * that merely recurs with different text in between (links to four files
+ * in one deep folder, a URL prefix in a table) is an answer, not a loop:
+ * that case cut correct answers and replaced them with "could not produce
+ * a clean answer" (measured 2026-11-09, private/parallel-tools/KONZEPT.md).
+ * The text in between is compared as is: links that differ only in a date
+ * are different links.
  */
 export function looksRepetitive(text: string): boolean {
   if (text.length < 240) return false;
   // A 60-char probe taken from near the end. If it recurs ≥4×, it's a loop.
   const probe = text.slice(-80, -20);
   if (probe.length < 40) return false;
-  let count = 0;
+  const at: number[] = [];
   let idx = text.indexOf(probe);
-  while (idx !== -1 && count < 4) {
-    count++;
+  while (idx !== -1) {
+    at.push(idx);
     idx = text.indexOf(probe, idx + probe.length);
   }
-  return count >= 4;
+  if (at.length < 4) return false;
+  const last = at.slice(-4);
+  const gap = (i: number): string => text.slice(last[i], last[i + 1]);
+  return gap(0) === gap(1) && gap(1) === gap(2);
 }
 
 /**
@@ -852,7 +867,15 @@ export const openAiCompatibleEngine: AgentEngine = {
     });
     // The listing is part of the system prompt, so the compaction check
     // and every rebuild see the same bytes the request carries.
-    const systemPromptForTurn = catalogPlan ? `${input.systemPrompt}\n\n${catalogPlan.listing}` : input.systemPrompt;
+    const withListing = catalogPlan ? `${input.systemPrompt}\n\n${catalogPlan.listing}` : input.systemPrompt;
+    // agentLoop.parallelToolHint (private/parallel-tools/KONZEPT.md §4):
+    // Hermes asks every model to batch independent calls. Here only a
+    // model that may call several tools at once is told, and only while
+    // the measurement has not decided it helps — off by default.
+    const systemPromptForTurn =
+      input.agentLoopConfig?.parallelToolHint === true && resolvedModel.model.parallelToolCalls === true && toolList.length > 0
+        ? `${withListing}\n\n${PARALLEL_TOOL_HINT}`
+        : withListing;
 
     let meta = (await metaStore.get(agent, session)) as OpenAiCompatibleMeta;
     let compactions = meta.compactions;
@@ -1149,7 +1172,6 @@ export const openAiCompatibleEngine: AgentEngine = {
     /** Quiet retries spent on malformed tool arguments this turn. */
     let argRerolls = 0;
     let reasoningOnlyNudges = 0;
-    let lastTodoRound = 1;
     /** Whether this turn wrote the task list: a turn that works the list
      *  is held to it at its end; a turn that only answers a question is
      *  not. */
@@ -1249,6 +1271,9 @@ export const openAiCompatibleEngine: AgentEngine = {
     const maxRounds = input.agentLoopConfig?.maxRounds ?? DEFAULT_MAX_TOOL_ROUNDS;
     const maxToolCallsPerTurn =
       input.agentLoopConfig?.maxToolCallsPerTurn ?? DEFAULT_MAX_TOOL_CALLS_PER_TURN;
+    // Calls of one round that may run side by side, at most this many at
+    // once (tool-concurrency.ts); 1 = one after another.
+    const limitTools = createLimiter(input.agentLoopConfig?.maxParallelTools ?? 8);
     const globalToolTimeoutMs =
       input.agentLoopConfig?.toolCallTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS;
 
@@ -1357,43 +1382,6 @@ export const openAiCompatibleEngine: AgentEngine = {
           }
           yield { kind: 'steer_applied', ts: ts(), engine: ENGINE, messages: steered };
         }
-        // Builder checkpoint: every 100 rounds the model refreshes its task
-        // list and appends a short status to its report file, so a crash
-        // in hour six loses minutes, not the night.
-        if (isBuilderTurn && round > 1 && round % 100 === 1 && toolList.some((t) => t.name === 'todo_write')) {
-          logger.info({ msg: 'engine.builder_checkpoint', engine: ENGINE, agent, session, round });
-          loopMessages.push({
-            role: 'user',
-            content:
-              `[somora] Checkpoint after ${round - 1} tool rounds: refresh your task list with todo_write (what is done, what is next), ` +
-              'append a short status (done / in progress / next) to your report file with file_write mode append if the task named one, ' +
-              'then continue where you were.',
-          } as ChatMessage);
-        }
-
-        // A stale task list: the list is what the person watches, and a
-        // model deep in its work stops writing it (measured 2026-09-23:
-        // one todo_write at round 1, none in the next 80 rounds, five
-        // compactions with the list in the block did not change that).
-        // Every TODO_STALE_ROUNDS rounds without a todo_write while items
-        // are open, one line asks for it.
-        if (isBuilderTurn && round - lastTodoRound >= TODO_STALE_ROUNDS && toolList.some((t) => t.name === 'todo_write')) {
-          lastTodoRound = round;
-          const todosNow = ((await metaStore.get(agent, session)) as { todos?: { content?: string; status?: string }[] }).todos;
-          const open = Array.isArray(todosNow) ? todosNow.filter((t) => t.status === 'pending' || t.status === 'in_progress') : [];
-          if (open.length > 0) {
-            logger.info({ msg: 'engine.todo_stale_nudge', engine: ENGINE, agent, session, round, open: open.length });
-            loopMessages.push({
-              role: 'user',
-              content:
-                `[somora] Your task list has not changed for ${TODO_STALE_ROUNDS} tool rounds and ${open.length} item(s) are still open ` +
-                `(in progress: ${open.filter((t) => t.status === 'in_progress').map((t) => t.content).join('; ') || 'none'}). ` +
-                'Bring it up to date with todo_write now — completed for what is verified, in_progress for the step you are on — then continue, ' +
-                'and from here on update the list in the round an item changes, not in a batch later.',
-            } as ChatMessage);
-          }
-        }
-
         // Does what we are about to send still fit? The pre-turn
         // compaction sized the conversation before any tool ran, and a
         // turn grows with every round: tool results, images, the tool
@@ -2261,6 +2249,54 @@ export const openAiCompatibleEngine: AgentEngine = {
           throw new Error('model requested tool_calls but no tool registry was passed to the engine');
         }
         let leadPending = roundContent;
+        // Tool calls of one round (private/parallel-tools/KONZEPT.md,
+        // 2026-11-09). Consecutive calls of tools that change nothing
+        // (`concurrent` on the definition: reads, searches, status
+        // lookups) run side by side, at most agentLoop.maxParallelTools at
+        // once; any other call is a barrier — it waits for the group
+        // before it, runs alone, and later calls start after it. Results,
+        // `tool` messages and their events go out in the model's order,
+        // so the record and the next round read exactly as when every
+        // call ran one after another. A call that throws (an abort, a
+        // tool that crashed) ends the turn as before, once the calls
+        // beside it have settled.
+        type CallOut = { events: NormalizedEvent[]; message: ChatMessage };
+        type Settled = { ok: true; out: CallOut } | { ok: false; err: unknown };
+        let group: Array<Promise<Settled>> = [];
+        const settle = (p: Promise<CallOut>): Promise<Settled> =>
+          p.then(
+            (out) => ({ ok: true as const, out }),
+            (err: unknown) => ({ ok: false as const, err }),
+          );
+        // The finished result of a call: its event and its `tool` message.
+        const resultOut = (callId: string, output: unknown, error: string | undefined, content: ChatMessage['content'] | string): CallOut => ({
+          events: [
+            {
+              kind: 'tool_result',
+              ts: ts(),
+              engine: ENGINE,
+              callId,
+              output,
+              ...(error !== undefined ? { error } : {}),
+            } as NormalizedEvent,
+          ],
+          message: { role: 'tool', tool_call_id: callId, content } as ChatMessage,
+        });
+        async function* flushGroup(): AsyncGenerator<NormalizedEvent> {
+          const pending = group;
+          group = [];
+          const settled = await Promise.all(pending);
+          for (const r of settled) {
+            if (!r.ok) throw r.err;
+            for (const ev of r.out.events) yield ev;
+            loopMessages.push(r.out.message);
+          }
+        }
+        // The per-turn budget is a hard limit: a reply with several calls
+        // used to run all of them and pass maxToolCallsPerTurn by the
+        // rest of the round (Fable review 2026-11-10 Nr. 27). Calls past
+        // the budget are answered as refused, not run.
+        let budgetLeft = Math.max(0, maxToolCallsPerTurn - totalToolCalls);
         for (const { call, args: parsedArgs, fault, why } of calls) {
           // Which tool really runs: tool_call unwraps to it, a deferred
           // name called directly runs as is (hydrated), a name the turn
@@ -2268,9 +2304,20 @@ export const openAiCompatibleEngine: AgentEngine = {
           // its arguments, so the chat and a rebuilt history read like a
           // direct call; only the model's own messages of this turn keep
           // the tool_call wrapper it wrote.
-          const route = fault ? null : routeCall(catalogPlan, offeredNames, call.function.name, parsedArgs);
+          const overBudget = !fault && budgetLeft <= 0;
+          if (!fault) budgetLeft -= 1;
+          const route: CallRoute | null = fault
+            ? null
+            : overBudget
+              ? { kind: 'reject', error: `tool budget of this turn (${maxToolCallsPerTurn} calls) is used up — answer from what you have` }
+              : routeCall(catalogPlan, offeredNames, call.function.name, parsedArgs);
           const runName = route?.kind === 'run' ? route.name : call.function.name;
           const runArgs = route?.kind === 'run' ? route.args : parsedArgs;
+          const toolDef = toolByName.get(runName);
+          // Not run (cut-off/malformed arguments, a search, a refusal):
+          // answered on the spot, which changes nothing either.
+          const alone = !fault && route?.kind === 'run' && !runsConcurrently(toolDef, runArgs);
+          if (alone) yield* flushGroup();
           yield {
             kind: 'tool_call',
             ts: ts(),
@@ -2303,19 +2350,7 @@ export const openAiCompatibleEngine: AgentEngine = {
                   'Call it again with less in one go: fewer items, shorter values, or split across several calls.'
                 : `Your call to ${call.function.name} was complete but its arguments are not valid JSON (${why}), so it was not run. ` +
                   'For a tool with no required parameters use {}. Call it again with valid JSON.';
-            yield {
-              kind: 'tool_result',
-              ts: ts(),
-              engine: ENGINE,
-              callId: call.id,
-              output: null,
-              error: message,
-            };
-            loopMessages.push({
-              role: 'tool',
-              tool_call_id: call.id,
-              content: message,
-            } as ChatMessage);
+            group.push(settle(Promise.resolve(resultOut(call.id, null, message, message))));
             continue;
           }
           if (route && route.kind !== 'run') {
@@ -2340,19 +2375,18 @@ export const openAiCompatibleEngine: AgentEngine = {
               tool: call.function.name,
               ...(route.kind === 'search' ? { args: parsedArgs } : { error: route.error }),
             });
-            yield {
-              kind: 'tool_result',
-              ts: ts(),
-              engine: ENGINE,
-              callId: call.id,
-              output: answered.ok ? answered.data : null,
-              ...(answered.ok ? {} : { error: answered.error }),
-            };
-            loopMessages.push({
-              role: 'tool',
-              tool_call_id: call.id,
-              content: answered.ok ? JSON.stringify(answered.data) : answered.error,
-            } as ChatMessage);
+            group.push(
+              settle(
+                Promise.resolve(
+                  resultOut(
+                    call.id,
+                    answered.ok ? answered.data : null,
+                    answered.ok ? undefined : answered.error,
+                    answered.ok ? JSON.stringify(answered.data) : answered.error,
+                  ),
+                ),
+              ),
+            );
             continue;
           }
           if (route?.via) {
@@ -2372,7 +2406,6 @@ export const openAiCompatibleEngine: AgentEngine = {
           // pin a slot indefinitely. Pattern adapted from OpenClaw's
           // waitForAgentRun — engine itself has no fixed cap, the caller
           // declares the budget.
-          const toolDef = toolByName.get(runName);
           const dynamicTimeout = toolDef?.timeoutFromInput?.(runArgs as never);
           const staticTimeout = toolDef?.defaultTimeoutMs;
           const hardCap = toolDef?.maxTimeoutMs;
@@ -2382,101 +2415,88 @@ export const openAiCompatibleEngine: AgentEngine = {
           // Timeout → error-shaped result the model can retry against.
           // Abort → AbortError so the turn ends without waiting out the
           // full tool budget (stop-button felt broken during long exec).
-          if (runName === 'todo_write') {
-            lastTodoRound = round;
-            todoWrittenThisTurn = true;
-          }
+          if (runName === 'todo_write') todoWrittenThisTurn = true;
           if (runName === 'acceptance_write') acceptanceWrittenThisTurn = true;
           if (turnWorked([runName])) workedThisTurn = true;
-          const invoked = await raceToolInvoke(tools.invoke(runName, runArgs), {
-            timeoutMs: toolTimeoutMs,
-            signal: effectiveSignal,
-            timeoutResult: {
-              ok: false as const,
-              error:
-                `tool '${runName}' timed out after ${toolTimeoutMs}ms` +
-                (dynamicTimeout !== undefined
-                  ? ` — call again with a higher timeout_ms if more time is needed`
-                  : ''),
-            },
-          });
-          // Catalog mode: a refused input names the closest real fields
-          // (the model saw only the compact signature), and the third
-          // identical failing tool_call ends the turn's tool use.
-          const result =
-            catalogPlan && !invoked.ok && invoked.error?.startsWith('invalid input for ')
-              ? { ...invoked, error: explainInvalidInput(invoked.error, toolDef) }
-              : invoked;
-          if (catalogPlan && !result.ok && route?.via === 'tool_call') {
-            const sig = `${call.function.name}:${call.function.arguments}`;
-            const n = (metaFailures.get(sig) ?? 0) + 1;
-            metaFailures.set(sig, n);
-            if (n >= 3) hitMetaLoop = true;
-          }
-          // Multimodal results (file_read polymorph on image/PDF) carry
-          // contentBlocks instead of a JSON-able payload. OpenAI's API
-          // accepts a content-array in tool messages with text and
-          // image_url entries — local openai-compatible servers (omlx,
-          // ollama) may reject this; the failure surfaces as an API
-          // error visible to the operator. The model side: gpt-5+,
-          // openrouter-claude, gemma-vision all accept it.
-          const isMultimodalOk = result.ok && result.contentBlocks !== undefined;
-          if (isMultimodalOk) {
-            const blocks = result.contentBlocks!;
-            const contentArray = blocks.map((b) => {
-              if (b.type === 'image') {
-                return {
-                  type: 'image_url' as const,
-                  image_url: {
-                    url: `data:${b.source.mediaType};base64,${b.source.data}`,
-                  },
-                };
-              }
-              if (b.type === 'text') {
-                return { type: 'text' as const, text: b.text };
-              }
-              return {
-                type: 'text' as const,
-                text: `[document content block (${b.source.mediaType}) — not delivered as inline content; use analyze_file]`,
-              };
-            });
-            yield {
-              kind: 'tool_result',
-              ts: ts(),
-              engine: ENGINE,
-              callId: call.id,
-              output: {
-                multimodal: true,
-                blocks: blocks.length,
-                kinds: blocks.map((b) => b.type),
+          const callId = call.id;
+          const callName = call.function.name;
+          const callArgsRaw = call.function.arguments;
+          const viaToolCall = route?.via === 'tool_call';
+          // The timeout starts when the call does — a call waiting for a
+          // free slot is not yet on its clock.
+          const run = limitTools(() => {
+            // Stopped while this call waited for a slot: it never starts
+            // (Codex review 2026-11-09 — freed slots started the queue).
+            if (effectiveSignal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+            return raceToolInvoke(tools.invoke(runName, runArgs), {
+              timeoutMs: toolTimeoutMs,
+              signal: effectiveSignal,
+              timeoutResult: {
+                ok: false as const,
+                error:
+                  `tool '${runName}' timed out after ${toolTimeoutMs}ms` +
+                  (dynamicTimeout !== undefined
+                    ? ` — call again with a higher timeout_ms if more time is needed`
+                    : ''),
               },
-            };
-            loopMessages.push({
-              role: 'tool',
-              tool_call_id: call.id,
+            });
+          }).then((invoked): CallOut => {
+            // Catalog mode: a refused input names the closest real fields
+            // (the model saw only the compact signature), and the third
+            // identical failing tool_call ends the turn's tool use.
+            const result =
+              catalogPlan && !invoked.ok && invoked.error?.startsWith('invalid input for ')
+                ? { ...invoked, error: explainInvalidInput(invoked.error, toolDef) }
+                : invoked;
+            if (catalogPlan && !result.ok && viaToolCall) {
+              const sig = `${callName}:${callArgsRaw}`;
+              const n = (metaFailures.get(sig) ?? 0) + 1;
+              metaFailures.set(sig, n);
+              if (n >= 3) hitMetaLoop = true;
+            }
+            // Multimodal results (file_read polymorph on image/PDF) carry
+            // contentBlocks instead of a JSON-able payload. OpenAI's API
+            // accepts a content-array in tool messages with text and
+            // image_url entries — local openai-compatible servers (omlx,
+            // ollama) may reject this; the failure surfaces as an API
+            // error visible to the operator. The model side: gpt-5+,
+            // openrouter-claude, gemma-vision all accept it.
+            const isMultimodalOk = result.ok && result.contentBlocks !== undefined;
+            if (isMultimodalOk) {
+              const blocks = result.contentBlocks!;
+              const contentArray = blocks.map((b) => {
+                if (b.type === 'image') {
+                  return {
+                    type: 'image_url' as const,
+                    image_url: {
+                      url: `data:${b.source.mediaType};base64,${b.source.data}`,
+                    },
+                  };
+                }
+                if (b.type === 'text') {
+                  return { type: 'text' as const, text: b.text };
+                }
+                return {
+                  type: 'text' as const,
+                  text: `[document content block (${b.source.mediaType}) — not delivered as inline content; use analyze_file]`,
+                };
+              });
               // The OpenAI SDK type accepts string | ContentArray for tool
               // messages; ts narrows tightly here so we cast.
-              content: contentArray,
-            } as ChatMessage);
-          } else {
-            const outputText = result.ok
-              ? JSON.stringify(result.data)
-              : (result.error ?? 'tool failed');
-            yield {
-              kind: 'tool_result',
-              ts: ts(),
-              engine: ENGINE,
-              callId: call.id,
-              output: result.ok ? result.data : null,
-              ...(result.ok ? {} : { error: result.error ?? 'tool failed' }),
-            };
-            loopMessages.push({
-              role: 'tool',
-              tool_call_id: call.id,
-              content: outputText,
-            } as ChatMessage);
-          }
+              return resultOut(
+                callId,
+                { multimodal: true, blocks: blocks.length, kinds: blocks.map((b) => b.type) },
+                undefined,
+                contentArray as unknown as ChatMessage['content'],
+              );
+            }
+            const outputText = result.ok ? JSON.stringify(result.data) : (result.error ?? 'tool failed');
+            return resultOut(callId, result.ok ? result.data : null, result.ok ? undefined : (result.error ?? 'tool failed'), outputText);
+          });
+          group.push(settle(run));
+          if (alone) yield* flushGroup();
         }
+        yield* flushGroup();
 
         if (hitMetaLoop) {
           logger.warn({ msg: 'engine.tool_meta_loop_stop', engine: ENGINE, agent, session, round });

@@ -18,6 +18,7 @@
 // Wire shapes below are transcribed from a recorded probe against
 // grok 0.2.106 — see the `session/update` variants in mapUpdate().
 
+import { StringDecoder } from 'node:string_decoder';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -32,7 +33,7 @@ import {
 import { logger } from '../server/logger.ts';
 import type { NormalizedEvent } from '../types/events.ts';
 import { grokCliReasoningArgs } from './thinking-params.ts';
-import { grokChildEnv, somoraGrokHome, syncGrokHome } from './grok-home.ts';
+import { ensureGatewayBlock, grokChildEnv, somoraGrokHome, syncGrokHome } from './grok-home.ts';
 import { resolveGrokLaunch } from './grok-bin.ts';
 import { buildCodexAttachments } from '../multimodal/user-content.ts';
 import { capReplayDelta, computeReplayDelta, getLastSeenTs, renderReplayPrefix, withLastSeenTs } from './replay.ts';
@@ -364,6 +365,16 @@ const ABORT_GRACE_MS = 3_000;
 const MCP_READY_TIMEOUT_MS = 30_000;
 const MCP_READY_POLL_MS = 250;
 
+const GATEWAY_PREFIX = 'managed_gateway:';
+
+/** Servers in an `_x.ai/mcp/list` answer that are active but not
+ *  somora's. A blocked xAI account connector is listed too, as
+ *  `managed_gateway:<name>` with status `unknown` (no session); an
+ *  active one is `ready` (measured with Grok 1.0.80). */
+export function foreignMcpServers(statuses: ReadonlyMap<string, string>, ours: ReadonlySet<string>): string[] {
+  return [...statuses.entries()].filter(([n, st]) => !ours.has(n) && st !== 'unknown').map(([n]) => n);
+}
+
 /** Server name → session status from an `_x.ai/mcp/list` answer. */
 export function mcpStatuses(result: unknown): Map<string, string> {
   const out = new Map<string, string>();
@@ -434,6 +445,9 @@ function imageMimeForPath(path: string): string {
 class AcpClient {
   private child: ChildProcessWithoutNullStreams;
   private buf = '';
+  /** A multi-byte character (an umlaut, an emoji) split across two pipe
+   *  reads stays whole; chunk.toString() made each half a U+FFFD. */
+  private readonly decoder = new StringDecoder('utf8');
   private nextId = 1;
   private pending = new Map<number, (f: JsonRpcFrame) => void>();
   /** Notifications + server->client requests, drained by the turn loop. */
@@ -484,7 +498,7 @@ class AcpClient {
   }
 
   private onData(chunk: Buffer): void {
-    this.buf += chunk.toString();
+    this.buf += this.decoder.write(chunk);
     let nl: number;
     while ((nl = this.buf.indexOf('\n')) >= 0) {
       const line = this.buf.slice(0, nl).trim();
@@ -629,6 +643,17 @@ class AcpClient {
       } catch {
         /* already gone */
       }
+      // A Grok that ignores SIGTERM is not left running (Fable review
+      // 2026-11-10 Nr. 26; the codex client does the same).
+      setTimeout(() => {
+        if (!this.closed) {
+          try {
+            this.child.kill('SIGKILL');
+          } catch {
+            /* already gone */
+          }
+        }
+      }, 3_000).unref();
     }
   }
 }
@@ -731,12 +756,22 @@ export const grokCliEngine: AgentEngine = {
       abortKill.unref?.();
     };
     input.signal?.addEventListener('abort', onAbort, { once: true });
+    // Stopped before it started: the listener above never fires for an
+    // already-aborted signal, and the turn ran in full (Fable review
+    // 2026-11-10 Nr. 27).
+    if (input.signal?.aborted) onAbort();
 
     let assistantText = '';
 
     // Reasoning trace from agent_thought_chunk.
     let thinkingText = '';
     let emittedAny = false;
+    /** The loop already ended the turn with an error (closed, silent):
+     *  no placeholder answer after it — that one survived the fallback,
+     *  left the session with two answers and paired the user's message
+     *  with "[somora] grok returned no content" in the replay (Fable
+     *  review 2026-11-10 Nr. 18). */
+    let loopErrored = false;
     /** A tool ran since the last text: the next text opens a paragraph. */
     let toolSinceText = false;
     /** Same for the reasoning trace: each model round's thoughts apart. */
@@ -762,7 +797,10 @@ export const grokCliEngine: AgentEngine = {
         const message = client.lastError
           ? client.lastError
           : `grok handshake failed: ${init.error.message}. Has \`grok login\` been run?`;
-        yield { kind: 'error', ts: Date.now(), engine: ENGINE, message };
+        // A Stop during the handshake killed the child: that is a stop,
+        // not an engine failure the fallback should answer.
+        if (input.signal?.aborted) yield { kind: 'assistant_message', ts: Date.now(), engine: ENGINE, text: '[somora] aborted by user' };
+        else yield { kind: 'error', ts: Date.now(), engine: ENGINE, message };
         yield { kind: 'turn_end', ts: Date.now(), engine: ENGINE, turnId };
         return;
       }
@@ -818,12 +856,14 @@ export const grokCliEngine: AgentEngine = {
         );
         const sid = (created.result as { sessionId?: string } | undefined)?.sessionId;
         if (created.error || !sid) {
-          yield {
-            kind: 'error',
-            ts: Date.now(),
-            engine: ENGINE,
-            message: `grok session/new failed: ${created.error?.message ?? 'no sessionId returned'}`,
-          };
+          if (input.signal?.aborted) yield { kind: 'assistant_message', ts: Date.now(), engine: ENGINE, text: '[somora] aborted by user' };
+          else
+            yield {
+              kind: 'error',
+              ts: Date.now(),
+              engine: ENGINE,
+              message: `grok session/new failed: ${created.error?.message ?? 'no sessionId returned'}`,
+            };
           yield { kind: 'turn_end', ts: Date.now(), engine: ENGINE, turnId };
           return;
         }
@@ -847,6 +887,26 @@ export const grokCliEngine: AgentEngine = {
         await new Promise((r) => setTimeout(r, MCP_READY_POLL_MS));
       }
       const notReady = [...mcpServerNames].filter((n) => statuses.get(n) !== 'ready');
+      // A server somora did not hand over is Grok's own: an xAI account
+      // connector (1.0.80 brought `cursor`, 101 tools on the person's X
+      // account). It is reachable through use_tool in this turn already,
+      // so say so loudly and block it in the Grok home for every later
+      // turn (grok-home.ts BLOCKED_GATEWAY_CONNECTORS is the known list).
+      const foreign = foreignMcpServers(statuses, mcpServerNames);
+      if (foreign.length > 0) {
+        const gateway = foreign.filter((n) => n.startsWith(GATEWAY_PREFIX)).map((n) => n.slice(GATEWAY_PREFIX.length));
+        const action = gateway.length > 0 ? ensureGatewayBlock(join(somoraGrokHome(), 'config.toml'), gateway) : 'none';
+        logger.warn({
+          msg: 'engine.grok_foreign_mcp',
+          engine: ENGINE,
+          agent: input.agent,
+          session: input.session,
+          servers: foreign,
+          blocked: gateway,
+          action,
+          hint: 'Grok offered MCP servers somora did not hand over (reachable through use_tool in this turn). xAI account connectors are now blocked in the Grok home for later turns; add them to BLOCKED_GATEWAY_CONNECTORS in grok-home.ts.',
+        });
+      }
       logger.info({
         msg: 'engine.grok_mcp_ready',
         engine: ENGINE,
@@ -1057,6 +1117,7 @@ export const grokCliEngine: AgentEngine = {
             // "[somora] aborted by user" assistant_message below covers
             // the abort case; only a genuine crash is an error.
             if (!input.signal?.aborted) {
+              loopErrored = true;
               yield {
                 kind: 'error',
                 ts: Date.now(),
@@ -1066,6 +1127,7 @@ export const grokCliEngine: AgentEngine = {
             }
             break;
           }
+          loopErrored = true;
           yield {
             kind: 'error',
             ts: Date.now(),
@@ -1332,7 +1394,7 @@ export const grokCliEngine: AgentEngine = {
           engine: ENGINE,
           message: `grok: ${apiError}`,
         };
-      } else if (finalText || !emittedAny) {
+      } else if (finalText || (!emittedAny && !loopErrored)) {
                 if (thinkingText) {
           yield { kind: 'thinking_message', ts: Date.now(), engine: ENGINE, text: thinkingText };
           thinkingText = '';

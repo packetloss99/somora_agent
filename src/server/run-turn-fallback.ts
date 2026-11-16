@@ -16,7 +16,7 @@
 // safely re-runnable — the next candidate would execute the tools a
 // second time. Better a visible error than a silent double-execution.
 
-import { resolveAnyRef, type Config, type ResolvedModel } from '../config/types.ts';
+import { resolveAnyRef, modelForKind, type Config, type EngineName, type ResolvedModel } from '../config/types.ts';
 import { isAvailabilityMessage } from '../engine/availability.ts';
 import { markModelAvailable, markModelUnavailable, modelRef, modelUnavailable, unavailableReason } from '../engine/model-availability.ts';
 import { engineRegistry } from '../engine/registry.ts';
@@ -30,6 +30,10 @@ interface Args {
   fallbackRefs: readonly string[];
   baseInput: Omit<TurnInput, 'resolvedModel'>;
   config?: Config;
+  /** The turn's thinking level came from the primary model's default
+   *  (neither the session nor the agent set one): a backup then runs
+   *  with its own default, not the primary's. */
+  thinkingFromModel?: boolean;
 }
 
 const REASON_MAX = 300;
@@ -171,7 +175,9 @@ export async function* runTurnWithFallback(args: Args): AsyncGenerator<Normalize
   const tried = new Set<string>([label(primary)]);
   for (let hop = 0; hop < fallbackRefs.length; hop++) {
     const ref = fallbackRefs[hop]!;
-    const candidate = resolveAnyRef(config, ref);
+    const found = resolveAnyRef(config, ref);
+    // A builder's backup runs with the backup's builder values too.
+    const candidate = found ? modelForKind(found, baseInput.agentKind) : null;
     if (!candidate) {
       logger.warn({ msg: 'engine.fallback_unresolved', hop: hop + 1, ref, after: label(current) });
       hops.push({ model: ref, reason: `fallback '${ref}' could not be resolved` });
@@ -241,6 +247,18 @@ export async function* runTurnWithFallback(args: Args): AsyncGenerator<Normalize
       resolvedModel: candidate,
       idleTimeoutMs: pickIdleTimeoutForEngine(config.engineWatchdog, candidate.provider.engine),
     };
+    // The relaxed limit while a tool runs belongs to the engine too: an
+    // openai-compatible primary has none, and a CLI backup then cut a
+    // 5-minute agent_ask off at its normal idle limit (Fable review
+    // 2026-11-10 Nr. 16, the fallback twin of a Juni-Audit fix).
+    const toolIdle = pickToolIdleTimeoutForEngine(config, candidate.provider.engine);
+    if (toolIdle !== undefined) input.toolIdleTimeoutMs = toolIdle;
+    else delete input.toolIdleTimeoutMs;
+    if (args.thinkingFromModel) {
+      const own = candidate.model.reasoning?.default;
+      if (own) input.thinking = own;
+      else delete input.thinking;
+    }
     current = candidate;
     failed.message = null;
     for await (const ev of attempt(current, input, onFail)) {
@@ -289,5 +307,31 @@ function pickIdleTimeoutForEngine(
       return cfg.grokCliIdleMs;
     case 'openai-compatible':
       return cfg.openaiCompatibleIdleMs;
+  }
+}
+
+/**
+ * Relaxed idle threshold to use while a tool call is outstanding on a CLI
+ * engine — the MCP tool timeout, so a legit long tool isn't cut off by
+ * the much shorter normal idle watchdog (Juni-Audit 2026-06). Returns
+ * undefined for openai-compatible (it disarms the watchdog during its own
+ * in-process tool loop instead).
+ */
+export function pickToolIdleTimeoutForEngine(
+  config: Config,
+  engine: EngineName,
+): number | undefined {
+  switch (engine) {
+    case 'claude-cli':
+      return config.claudeCli.mcpToolTimeoutMs;
+    case 'codex-cli':
+      return config.codexCli.toolTimeoutSec * 1000;
+    case 'grok-cli':
+      // No grok-specific knob (the MCP-side timeout is grok's own); the
+      // question here is only "how long may a tool run before the
+      // engine counts as wedged", so borrow the larger sibling budget.
+      return Math.max(config.claudeCli.mcpToolTimeoutMs, config.codexCli.toolTimeoutSec * 1000);
+    case 'openai-compatible':
+      return undefined;
   }
 }

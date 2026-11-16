@@ -35,6 +35,7 @@ import {
   describeModelRefs,
   listAllModels,
   resolveAnyRef,
+  modelForKind,
   workerChain,
   type ThinkingLevel,
   type SamplingConfig,
@@ -42,7 +43,7 @@ import {
 import { describeMedia } from '../tools/file/analyze.ts';
 import { loadAttachment } from '../multimodal/load.ts';
 import { engineRegistry } from '../engine/registry.ts';
-import { runTurnWithFallback } from './run-turn-fallback.ts';
+import { pickToolIdleTimeoutForEngine, runTurnWithFallback } from './run-turn-fallback.ts';
 import { clearTurnOrigin, setTurnOrigin } from './turn-origin.ts';
 import { drainSteer, frameSteerMessage, markSteerable, requeueSteer, unmarkSteerable } from './steer-inbox.ts';
 import { resolveAgentLoop } from './builder-prompt.ts';
@@ -113,7 +114,8 @@ function resolveEffectiveModel(
   const override = sessionMeta.modelOverride;
   const ref = typeof override === 'string' && override.length > 0 ? override : persona.model;
   if (!ref) return null;
-  return resolveAnyRef(config, ref);
+  const resolved = resolveAnyRef(config, ref);
+  return resolved ? modelForKind(resolved, persona.kind) : null;
 }
 
 // Resolve the idle-event watchdog timeout per engine. Defaults live in
@@ -131,32 +133,6 @@ function pickIdleTimeoutForEngine(
       return cfg.grokCliIdleMs;
     case 'openai-compatible':
       return cfg.openaiCompatibleIdleMs;
-  }
-}
-
-/**
- * Relaxed idle threshold to use while a tool call is outstanding on a CLI
- * engine — the MCP tool timeout, so a legit long tool isn't cut off by
- * the much shorter normal idle watchdog (Juni-Audit 2026-06). Returns
- * undefined for openai-compatible (it disarms the watchdog during its own
- * in-process tool loop instead).
- */
-function pickToolIdleTimeoutForEngine(
-  config: import('../config/types.ts').Config,
-  engine: import('../config/types.ts').EngineName,
-): number | undefined {
-  switch (engine) {
-    case 'claude-cli':
-      return config.claudeCli.mcpToolTimeoutMs;
-    case 'codex-cli':
-      return config.codexCli.toolTimeoutSec * 1000;
-    case 'grok-cli':
-      // No grok-specific knob (the MCP-side timeout is grok's own); the
-      // question here is only "how long may a tool run before the
-      // engine counts as wedged", so borrow the larger sibling budget.
-      return Math.max(config.claudeCli.mcpToolTimeoutMs, config.codexCli.toolTimeoutSec * 1000);
-    case 'openai-compatible':
-      return undefined;
   }
 }
 
@@ -843,7 +819,8 @@ export async function runChatTurn(args: RunChatTurnArgs): Promise<ChatTurnResult
   deps.onActivity(agent);
 
   const modelSupportsReasoning = resolvedModel.model.capabilities.includes('reasoning');
-  const effectiveThinking = resolveThinking(persona, sessionMeta, resolvedModel.model).level;
+  const thinkingResolved = resolveThinking(persona, sessionMeta, resolvedModel.model);
+  const effectiveThinking = thinkingResolved.level;
   const effectiveSampling = resolveEffectiveSampling(resolvedModel.model, persona, sessionMeta);
   // What the openai-compatible engine will actually put on the wire for
   // this level (per-model `reasoning.levels`). Only sent to clients when
@@ -1064,6 +1041,7 @@ export async function runChatTurn(args: RunChatTurnArgs): Promise<ChatTurnResult
       primary: resolvedModel,
       fallbackRefs: persona.fallback,
       config: deps.config,
+      thinkingFromModel: thinkingResolved.source === 'model-default' || thinkingResolved.source === 'engine-default',
       baseInput: {
         agent,
         session,

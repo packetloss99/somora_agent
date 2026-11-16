@@ -8,11 +8,11 @@ import { getLspManager } from '../../lsp/index.ts';
 import { LSP_SERVERS, findBinary } from '../../lsp/registry.ts';
 import { type Persona, listAgents, loadPersona } from '../../persona/loader.ts';
 import { resolveSessionId, sessionMetaStore } from '../../storage/sessions.ts';
-import { checkWriteAllowed, expandHome } from '../../tools/file/policy.ts';
+import { checkWriteAllowed, realpathSafeAncestor, expandHome } from '../../tools/file/policy.ts';
 import { checkWriteAllow } from '../../tools/file/write-scope.ts';
 import { registerAskCall } from '../ask-calls.ts';
 import { claimOfSession, describeClaim, listWorkdirClaims, workdirClaimedBy } from '../builder-busy.ts';
-import { answerQuestion, askQuestion, pendingQuestion } from '../builder-questions.ts';
+import { MAX_DETAILS_CHARS, answerQuestion, askQuestion, pendingQuestion } from '../builder-questions.ts';
 import { CHAT_QUESTION_TIMEOUT_MS, TURN_ATTENDED_KEY, asksWithoutWaiting } from '../ask-attended.ts';
 import { askWithoutWaiting } from '../async-questions.ts';
 import { type BuilderMode, type BuilderPhase, DEFAULT_PLAN_FILE, type TodoItem, archiveNameFor, patchBuilderState, readBuilderState } from '../builder-session.ts';
@@ -218,8 +218,8 @@ export function registerBuilderRoutes(app: Hono, routeDeps: BuilderRoutesDeps): 
     const state = await patchBuilderState(sessionMetaStore, r.agent, r.session, { phase: 'build' });
     await publish(r.agent, r.session, { event: 'builder_state', data: { mode: state.mode, phase: state.phase, planPath: state.planPath } });
     const text =
-      `The plan${state.planPath ? ` at ${state.planPath}` : ''} is approved — GO. Execute it now: read the plan first, keep the task list with todo_write, ` +
-      `verify each step, and end with the report.${body.note ? `\n\n${body.note.trim()}` : ''}`;
+      `The plan${state.planPath ? ` at ${state.planPath}` : ''} is approved — GO. Execute it now: read the plan first, ` +
+      `check your work as you go, and end with the report.${body.note ? `\n\n${body.note.trim()}` : ''}`;
     const turnId = randomUUID();
     // An order that came from another agent (builder_dispatch with
     // phase: plan) has an orderer waiting for the result. The Go turn
@@ -365,6 +365,11 @@ export function registerBuilderRoutes(app: Hono, routeDeps: BuilderRoutesDeps): 
     const planPath = state?.planPath ?? joinPath(workdirFromMeta(meta as Record<string, unknown>, r.persona, config).path, DEFAULT_PLAN_FILE);
     const policy = checkWriteAllowed(planPath, r.agent);
     if (!policy.ok) return c.json({ error: policy.reason }, 400);
+    // Checked again on the real path, as the file tools do: a symlinked
+    // folder must not carry the plan somewhere the policy blocks (Fable
+    // review Nr. 28).
+    const realPolicy = checkWriteAllowed(await realpathSafeAncestor(planPath), r.agent);
+    if (!realPolicy.ok) return c.json({ error: realPolicy.reason }, 400);
     await mkdirFs(dirname(planPath), { recursive: true });
     // A plan file that is already there and was not written by this
     // session (an earlier build's plan, a person's own) is history, not a
@@ -413,10 +418,12 @@ export function registerBuilderRoutes(app: Hono, routeDeps: BuilderRoutesDeps): 
       options?: unknown;
       multiple?: unknown;
       timeout_ms?: unknown;
+      details?: unknown;
     } | null;
     if (!body || typeof body.question !== 'string' || !Array.isArray(body.options)) {
-      return c.json({ error: 'body must be { question, options: [{label, description?}], multiple?, timeout_ms? }' }, 400);
+      return c.json({ error: 'body must be { question, options: [{label, description?}], multiple?, timeout_ms?, details? }' }, 400);
     }
+    const details = typeof body.details === 'string' && body.details.trim() ? body.details.trim().slice(0, MAX_DETAILS_CHARS) : undefined;
     const options = (body.options as unknown[])
       .map((o) => {
         if (!o || typeof o !== 'object') return null;
@@ -442,6 +449,7 @@ export function registerBuilderRoutes(app: Hono, routeDeps: BuilderRoutesDeps): 
           agent: r.agent,
           session: r.session,
           source: 'ask_user',
+          ...(details ? { details } : {}),
           parts: [
             {
               question: body.question.trim().slice(0, 2000),
@@ -466,6 +474,7 @@ export function registerBuilderRoutes(app: Hono, routeDeps: BuilderRoutesDeps): 
         ...(typeof body.header === 'string' && body.header.trim() ? { header: body.header.trim().slice(0, 40) } : {}),
         options,
         multiple: body.multiple === true,
+        ...(details ? { details } : {}),
         // A builder's question may wait 30 minutes; a chat agent's turn
         // holds the conversation, so 10 unless it asks for another time.
         ...(typeof body.timeout_ms === 'number' ? { timeoutMs: body.timeout_ms } : r.persona.kind !== 'builder' ? { timeoutMs: CHAT_QUESTION_TIMEOUT_MS } : {}),
@@ -473,7 +482,7 @@ export function registerBuilderRoutes(app: Hono, routeDeps: BuilderRoutesDeps): 
       (q) => {
         void publish(r.agent, r.session, {
           event: 'question_asked',
-          data: { questionId: q.id, question: q.question, ...(q.header ? { header: q.header } : {}), options: q.options, multiple: q.multiple, expiresAt: q.expiresAt },
+          data: { questionId: q.id, question: q.question, ...(q.header ? { header: q.header } : {}), options: q.options, multiple: q.multiple, expiresAt: q.expiresAt, ...(q.details ? { details: q.details } : {}) },
         });
       },
     );

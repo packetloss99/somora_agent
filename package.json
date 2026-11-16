@@ -1,6 +1,6 @@
 {
   "name": "somora",
-  "version": "2026.1106.3",
+  "version": "2026.1111.1",
   "description": "A self-hosted multi-agent harness: your agents, your models, one server — with memory, a shared wiki, a web desktop, a phone app and a terminal client.",
   "type": "module",
   "license": "MIT",
@@ -67,24 +67,24 @@
     "prepack": "npm run build:all"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.9.0",
+    "@agentclientprotocol/sdk": "^2.5.0",
     "@anthropic-ai/claude-agent-sdk": "^0.3.293",
-    "@anthropic-ai/sdk": "^0.132.1",
-    "@hono/node-server": "2.1.4",
+    "@anthropic-ai/sdk": "^1.8.0",
+    "@hono/node-server": "2.1.6",
     "@huggingface/transformers": "^4.3.1",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@mozilla/readability": "^0.6.0",
-    "@openai/codex": "0.161.0",
+    "@openai/codex": "0.167.0",
     "adm-zip": "^0.6.0",
     "better-sqlite3": "^13.0.3",
-    "chokidar": "^5.0.0",
+    "chokidar": "^6.0.0",
     "gray-matter": "^4.0.3",
-    "hono": "4.13.13",
+    "hono": "4.13.17",
     "ink": "^8.0.0",
     "ink-spinner": "^5.0.0",
     "ink-text-input": "^6.0.0",
     "js-yaml": "^5.4.3",
-    "jsdom": "^30.1.2",
+    "jsdom": "^31.0.0",
     "node-pty": "^1.1.0",
     "openai": "^7.30.1",
     "pdf-to-img": "^7.0.0",
@@ -105,10 +105,10 @@
     "zod": "^4.6.5"
   },
   "optionalDependencies": {
-    "@xai-official/grok-darwin-arm64": "1.0.46",
-    "@xai-official/grok-darwin-x64": "1.0.46",
-    "@xai-official/grok-linux-arm64": "1.0.46",
-    "@xai-official/grok-linux-x64": "1.0.46"
+    "@xai-official/grok-darwin-arm64": "1.0.80",
+    "@xai-official/grok-darwin-x64": "1.0.80",
+    "@xai-official/grok-linux-arm64": "1.0.80",
+    "@xai-official/grok-linux-x64": "1.0.80"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",

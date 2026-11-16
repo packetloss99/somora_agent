@@ -10,6 +10,7 @@
 //                once and, FAKE_LATER_MS later, a result on its own
 //                (a tool call and a reply in pieces)
 // Env: FAKE_AGENT_NAME (agentInfo.name), FAKE_NO_RESUME=1 (offer load only),
+//      FAKE_IGNORE_CANCEL=1 (session/cancel does nothing),
 //      FAKE_STDERR (written to stderr at start), FAKE_FAIL_INIT=1,
 //      FAKE_INIT_DELAY_MS / FAKE_SESSION_DELAY_MS (answer initialize /
 //      session/new that much later); FAKE_SESSION_GATE_DIR signals
@@ -18,7 +19,9 @@ import { Readable, Writable } from 'node:stream';
 import { existsSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { AgentSideConnection, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
+// `/unstable`: the prompt response below carries `usage` (SDK 2 strips it on
+// the stable entrypoint).
+import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk/unstable';
 
 if (process.env.FAKE_STDERR) process.stderr.write(process.env.FAKE_STDERR + '\n');
 if (process.env.FAKE_FAIL_INIT) {
@@ -33,7 +36,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const text = (t) => ({ type: 'text', text: t });
 
 const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
-new AgentSideConnection((conn) => {
+let handle = null;
+const conn = {
+  sessionUpdate: (p) => handle.client.notify(methods.client.session.update, p),
+  requestPermission: (p) => handle.client.request(methods.client.session.requestPermission, p),
+};
+const impl = (() => {
   const update = (sessionId, u) => conn.sessionUpdate({ sessionId, update: u });
   return {
     async initialize() {
@@ -49,7 +57,9 @@ new AgentSideConnection((conn) => {
         authMethods: [],
       };
     },
-    async authenticate() {},
+    async authenticate() {
+      return {};
+    },
     async newSession() {
       if (process.env.FAKE_SESSION_GATE_DIR) {
         await writeFile(join(process.env.FAKE_SESSION_GATE_DIR, 'started'), '');
@@ -77,7 +87,8 @@ new AgentSideConnection((conn) => {
       return { sessions: [...sessions.keys()].map((id) => ({ sessionId: id, cwd: '/', title: id })) };
     },
     async cancel(p) {
-      cancelled.add(p.sessionId);
+      // FAKE_IGNORE_CANCEL=1: an agent that never stops on cancel.
+      if (!process.env.FAKE_IGNORE_CANCEL) cancelled.add(p.sessionId);
     },
     async prompt(p) {
       const sid = p.sessionId;
@@ -147,4 +158,14 @@ new AgentSideConnection((conn) => {
       return { stopReason: 'end_turn', usage: { inputTokens: 50, outputTokens: 10, totalTokens: 60 } };
     },
   };
-}, stream);
+})();
+handle = agent({ name: 'fake-agent' })
+  .onRequest(methods.agent.initialize, (c) => impl.initialize(c.params))
+  .onRequest(methods.agent.authenticate, () => impl.authenticate())
+  .onRequest(methods.agent.session.new, (c) => impl.newSession(c.params))
+  .onRequest(methods.agent.session.resume, (c) => impl.resumeSession(c.params))
+  .onRequest(methods.agent.session.load, (c) => impl.loadSession(c.params))
+  .onRequest(methods.agent.session.list, (c) => impl.listSessions(c.params))
+  .onRequest(methods.agent.session.prompt, (c) => impl.prompt(c.params))
+  .onNotification(methods.agent.session.cancel, (c) => impl.cancel(c.params))
+  .connect(stream);

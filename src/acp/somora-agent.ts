@@ -10,8 +10,6 @@
 // somora session ids.
 
 import type {
-  Agent,
-  AgentSideConnection,
   AuthenticateResponse,
   CancelNotification,
   InitializeRequest,
@@ -26,10 +24,15 @@ import type {
   PromptRequest,
   PromptResponse,
   ResumeSessionRequest,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
   ResumeSessionResponse,
+  SessionNotification,
   SessionUpdate,
+  Stream,
+  AgentConnection,
 } from '@agentclientprotocol/sdk';
-import { RequestError } from '@agentclientprotocol/sdk';
+import { RequestError, agent as acpAgent, methods } from '@agentclientprotocol/sdk';
 import { SseToAcp, historyToAcp, type SseFrame } from './translate.ts';
 import type { NormalizedEvent } from '../types/events.ts';
 
@@ -62,7 +65,7 @@ interface SessionRow {
 
 /** A non-waiting question as reply text: each question with its
  *  options, for the person to answer with the next prompt. */
-export function asyncQuestionText(q: { question?: unknown; options?: unknown; parts?: unknown }): string {
+export function asyncQuestionText(q: { question?: unknown; options?: unknown; parts?: unknown; details?: unknown }): string {
   type Part = { question: string; options: Array<{ label: string }> };
   const parts: Part[] = Array.isArray(q.parts) && q.parts.length > 0
     ? (q.parts as Part[])
@@ -70,7 +73,8 @@ export function asyncQuestionText(q: { question?: unknown; options?: unknown; pa
   const blocks = parts
     .filter((p) => p && typeof p.question === 'string' && p.question)
     .map((p) => [`❓ ${p.question}`, ...(p.options ?? []).map((o) => `- ${o.label}`)].join('\n'));
-  return `\n\n${blocks.join('\n\n')}`;
+  const details = typeof q.details === 'string' && q.details ? `\n\n${q.details}` : '';
+  return `${details}\n\n${blocks.join('\n\n')}`;
 }
 
 /** A question's option → the ACP option kind (the server sends the kind
@@ -129,7 +133,40 @@ interface PromptRun {
   stream: AbortController;
 }
 
-export class SomoraAcpAgent implements Agent {
+/** The editor side as the agent calls it: session updates out, a
+ *  permission question in. */
+export interface AcpClientPeer {
+  sessionUpdate(params: SessionNotification): Promise<void>;
+  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
+}
+
+/**
+ * Serve one ACP client on a stream: every method `SomoraAcpAgent`
+ * handles, registered on an SDK agent app (SDK 2: apps replaced the
+ * AgentSideConnection class; the wire protocol is ACP v1 as before).
+ */
+export function serveSomoraAcp(stream: Stream, opts: SomoraAcpOptions): AgentConnection {
+  let handle: AgentConnection | null = null;
+  const peer: AcpClientPeer = {
+    sessionUpdate: (p) => handle!.client.notify(methods.client.session.update, p),
+    requestPermission: (p) => handle!.client.request(methods.client.session.requestPermission, p),
+  };
+  const impl = new SomoraAcpAgent(peer, opts);
+  handle = acpAgent({ name: 'somora' })
+    .onRequest(methods.agent.initialize, (c) => impl.initialize(c.params))
+    .onRequest(methods.agent.authenticate, () => impl.authenticate())
+    .onRequest(methods.agent.session.new, (c) => impl.newSession(c.params))
+    .onRequest(methods.agent.session.list, (c) => impl.listSessions(c.params))
+    .onRequest(methods.agent.session.load, (c) => impl.loadSession(c.params))
+    .onRequest(methods.agent.session.resume, (c) => impl.resumeSession(c.params))
+    .onRequest(methods.agent.session.close, () => impl.closeSession())
+    .onRequest(methods.agent.session.prompt, (c) => impl.prompt(c.params))
+    .onNotification(methods.agent.session.cancel, (c) => impl.cancel(c.params))
+    .connect(stream);
+  return handle;
+}
+
+export class SomoraAcpAgent {
   /** Running prompts by session: cancel stops them. */
   private readonly running = new Map<string, PromptRun>();
   /** New sessions are only noted until their first prompt: a client
@@ -159,7 +196,7 @@ export class SomoraAcpAgent implements Agent {
   }
 
   constructor(
-    private readonly conn: AgentSideConnection,
+    private readonly conn: AcpClientPeer,
     private readonly opts: SomoraAcpOptions,
   ) {}
 
@@ -427,6 +464,11 @@ export class SomoraAcpAgent implements Agent {
     const options = Array.isArray(q.options) ? (q.options as Array<{ label: string; description?: string }>) : [];
     if (!id || options.length === 0) return;
     const question = typeof q.question === 'string' ? q.question : 'The agent asks';
+    // The dialog has a title, not a body: what is decided on goes into
+    // the reply right before it.
+    if (typeof q.details === 'string' && q.details) {
+      await this.conn.sessionUpdate({ sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `\n\n${q.details}\n\n` } } });
+    }
     let r;
     try {
       r = await this.conn.requestPermission({

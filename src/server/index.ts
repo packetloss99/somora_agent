@@ -1,4 +1,6 @@
 import { resolveBrowserSession } from '../browser/session.ts';
+import { fileURLToPath } from 'node:url';
+import { killRunningLocalExecs } from '../tools/exec/local.ts';
 import { readLogSince, readLogTail } from './logs.ts';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
@@ -22,7 +24,7 @@ import { resolve as resolvePath } from 'node:path';
 import { WebSocketServer } from 'ws';
 import { applyClaudeCliSdkEnv, applyCodexCliEnv, configPath, currentConfigProblem, getFreshConfig, loadConfig, primeFreshConfig } from '../config/loader.ts';
 import { stat as statFile } from 'node:fs/promises';
-import { workerChain, type Config, resolveAnyRef, describeModelRefs } from '../config/types.ts';
+import { workerChain, type Config, resolveAnyRef, modelForKind, describeModelRefs } from '../config/types.ts';
 import { storeAttachment } from '../attachments/store.ts';
 import { videoRequestFromBody, VideoRequestError } from '../videogen/request.ts';
 import { checkSlot as checkVideoSlot, listJobs as listVideoJobs } from '../videogen/jobs.ts';
@@ -112,13 +114,13 @@ import { sessionToolAllows } from './ask-attended.ts';
 import { configureStartTurn, startTurn } from './start-turn.ts';
 import type { TurnOrigin } from './turn-origin-kind.ts';
 import { VoiceCallManager } from '../voice/realtime/manager.ts';
-import type { VoiceCallSnapshot } from '../voice/realtime/call.ts';
+import type { SessionVoiceWork, VoiceCallSnapshot } from '../voice/realtime/call.ts';
 import type { RealtimeEvent } from '../voice/realtime/types.ts';
 import { DequeuedError, listSessionWaiters, getSessionLockStatus } from './session-queue.ts';
 import { readPersonaFiles, writePersonaFile } from '../persona/files.ts';
 import { assembleSystemPrompt } from './prompt-assembly.ts';
 import { getResolvedTeam, loadTeamFile, teamFilePath } from '../team/store.ts';
-import { configureWorkWake, markFetched, onWorkFinished, openWork, getWork, setWaiting } from './work-ledger.ts';
+import { configureWorkWake, markFetched, onWorkFinished, openWork, getWork, setWaiting, listWork, openChainMembers, wakeAnswersFor, inTreeOf } from './work-ledger.ts';
 import { sessionSlugOf as a2aSessionSlugOf } from '../engine/a2a.ts';
 import { readLockfile } from './lockfile.ts';
 import { acquireLockfile, LockfileBusy, releaseLockfile } from './lockfile.ts';
@@ -356,7 +358,8 @@ export function resolveEffectiveModel(
   const override = sessionMeta.modelOverride;
   const ref = (typeof override === 'string' && override.length > 0 ? override : persona.model);
   if (!ref) return null;
-  return resolveAnyRef(config, ref);
+  const resolved = resolveAnyRef(config, ref);
+  return resolved ? modelForKind(resolved, persona.kind) : null;
 }
 
 // Runs the primary engine. If the primary fails before yielding any
@@ -845,7 +848,9 @@ const bindHost = process.env.SOMORA_HOST ?? configHost;
 // reach back to /chat/send-sync. When the server binds to 0.0.0.0
 // for LAN access, that's not a valid client target — substitute
 // 127.0.0.1 in the env so children loopback rather than guessing.
-if (bindHost === '0.0.0.0') {
+// `::` (all IPv6, usually all IPv4 too) is the same case: children built
+// `http://:::18737` and every call back from an MCP child failed.
+if (bindHost === '0.0.0.0' || bindHost === '::' || bindHost === '[::]') {
   process.env.SOMORA_HOST = '127.0.0.1';
 }
 
@@ -896,7 +901,10 @@ if (tlsConf?.publicHost && bindHost === '127.0.0.1') {
 // `web/dist/` (vite output, base `/web/`), so mounting them at
 // `/web/*` makes the same-origin path work in production. Dev still
 // uses vite at :5173 with a proxy to this server.
-const webDistDir = new URL('../../web/dist/', import.meta.url).pathname;
+// fileURLToPath, not .pathname: a space or umlaut in the install path
+// stays percent-encoded in .pathname and /web answered 404 (Fable review
+// Nr. 25).
+const webDistDir = fileURLToPath(new URL('../../web/dist/', import.meta.url));
 // Must be registered BEFORE the static mount: `/web/*` also matches the
 // bare `/web`, and the rewrite's optional slash turns it into `/` — so a
 // mount-first order serves index.html at `/web` with 200 and the redirect
@@ -921,7 +929,7 @@ app.use(
 // passthrough. Service-worker scope is `/mobile/`, manifest start_url
 // is `/mobile/` — both match this mount, so "add to home screen"
 // from a phone parks the user at the right entry point.
-const mobileDistDir = new URL('../../web-mobile/dist/', import.meta.url).pathname;
+const mobileDistDir = fileURLToPath(new URL('../../web-mobile/dist/', import.meta.url));
 // Same ordering requirement as `/web` above.
 app.get('/mobile', (c) => c.redirect('/mobile/'));
 app.use(
@@ -1104,6 +1112,10 @@ configureUnprompted({ publish });
 // One watcher per live call: the socket that is listening to it.
 export const voiceWatchers = new Map<string, (ev: RealtimeEvent, snap: VoiceCallSnapshot) => void>();
 export const voiceStateWatchers = new Map<string, (snap: VoiceCallSnapshot) => void>();
+/** Voice consults the status tool of a call looks at: the last 6 h. */
+const VOICE_WORK_WINDOW_MS = 6 * 60 * 60 * 1000;
+/** Finished work it names: reported within the last 30 min. */
+const VOICE_FINISHED_SHOWN_MS = 30 * 60 * 1000;
 export const voiceCalls = new VoiceCallManager({
   get config() {
     return config;
@@ -1202,8 +1214,55 @@ export const voiceCalls = new VoiceCallManager({
       return { state: 'pending', ...(position ? { position } : {}) };
     }
     markFetched(consultId);
-    if (it.state === 'done') return { state: 'done', text: it.result?.finalText ?? '' };
+    if (it.state === 'done') {
+      // The answer is frozen at its turn's end. What the agent reported
+      // in this session about work that finished later is the newer
+      // state (2026-11-06: "still running" re-read a minute after the
+      // work had finished, and spoken as current).
+      const at = it.finishedAt;
+      const newer: string[] = [];
+      if (at !== undefined) {
+        for (const w of listWork({ target: it.target, kinds: ['wake'], states: ['done'] })) {
+          if ((w.finishedAt ?? 0) <= at) continue;
+          const t = (w.result?.finalText ?? '').trim();
+          if (t && !newer.includes(t)) newer.push(t);
+        }
+      }
+      return {
+        state: 'done',
+        text: it.result?.finalText ?? '',
+        ...(at !== undefined ? { finishedAt: at } : {}),
+        ...(newer.length > 0 ? { newer: newer.slice(-3) } : {}),
+      };
+    }
     return { state: 'failed', error: it.error ?? 'unknown error' };
+  },
+  sessionVoiceWork: async (agent, session) => {
+    // The voice consults of this session from the last hours, any call:
+    // still running, answered with work still going, or that work
+    // finished recently (with what the agent reported about it).
+    const now = Date.now();
+    const out: SessionVoiceWork[] = [];
+    for (const it of listWork({ target: { agent, session }, kinds: ['voice'] })) {
+      if (now - it.enqueuedAt > VOICE_WORK_WINDOW_MS) continue;
+      if (it.state === 'queued' || it.state === 'running') {
+        out.push({ consultId: it.id, question: it.preview, state: 'running' });
+        continue;
+      }
+      if (it.state !== 'done') continue;
+      if (openChainMembers(it.id).length > 0) {
+        out.push({ consultId: it.id, question: it.preview, state: 'working_on' });
+        continue;
+      }
+      const reports = wakeAnswersFor(it);
+      const lastWake = listWork({ target: { agent, session }, kinds: ['wake'], states: ['done'] })
+        .filter((w) => inTreeOf(w, it.id))
+        .reduce((m, w) => Math.max(m, w.finishedAt ?? 0), 0);
+      if (reports.length > 0 && now - lastWake < VOICE_FINISHED_SHOWN_MS) {
+        out.push({ consultId: it.id, question: it.preview, state: 'finished', text: reports.join('\n\n') });
+      }
+    }
+    return out;
   },
   markConsultFetched: async (consultId) => {
     markFetched(consultId);
@@ -1621,28 +1680,51 @@ logger.info({ msg: 'transport.liveness', ...liveness, keepAliveDelayMs: config.s
 
 // Best-effort cleanup on signal — keeps embedding processes from lingering
 // and SQLite handles closed cleanly. tsx watch tends to send SIGTERM on reload.
+let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   logger.info({ msg: 'server.shutdown', signal });
+  // Bounded: a step that hangs or throws must not keep the process up
+  // until systemd's SIGKILL — or forever without systemd (Fable review
+  // 2026-11-10 Nr. 20).
+  const deadline = setTimeout(() => {
+    logger.warn({ msg: 'server.shutdown_deadline', signal, ms: SHUTDOWN_DEADLINE_MS });
+    process.exit(0);
+  }, SHUTDOWN_DEADLINE_MS);
+  deadline.unref();
+  const step = async (name: string, fn: () => unknown): Promise<void> => {
+    try {
+      await fn();
+    } catch (err) {
+      logger.warn({ msg: 'server.shutdown_step_failed', step: name, err: String(err) });
+    }
+  };
+  // Foreground exec commands of openai-compatible turns run in this
+  // process; without this they outlived the server (the MCP child of
+  // the CLI engines already did it).
+  await step('execs', () => killRunningLocalExecs());
   // Await: aborts in-flight REM runs and waits (bounded, 5s) until the
   // aborted dream lands as `paused` on disk — exiting earlier archived
   // it as empty-processed instead (report 2026-07-25, restart-kills).
-  await remWorker.shutdown();
-  await shutdownLsp();
-  deepWorker.shutdown();
-  lucidWorker.shutdown();
+  await step('rem', () => remWorker.shutdown());
+  await step('lsp', () => shutdownLsp());
+  await step('deep', () => deepWorker.shutdown());
+  await step('lucid', () => lucidWorker.shutdown());
   // A standing call is a paid connection. Exiting without closing it
   // leaves the provider to notice the dead socket in its own time, and
   // the meter runs until it does.
-  await voiceCalls.stopAll(`server ${signal}`).catch(() => {});
-  releaseLockfile();
-  stopClaudeCredentialSyncWatcher();
-  await shutdownMemoryRegistry();
-  await screencasts.shutdown().catch(() => {});
-  await browserService.shutdown().catch(() => {});
-  closeAllExternal();
-  await shutdownSshPool();
+  await step('voice', () => voiceCalls.stopAll(`server ${signal}`));
+  await step('lockfile', () => releaseLockfile());
+  await step('claude-sync', () => stopClaudeCredentialSyncWatcher());
+  await step('memory', () => shutdownMemoryRegistry());
+  await step('screencasts', () => screencasts.shutdown());
+  await step('browser', () => browserService.shutdown());
+  await step('external', () => closeAllExternal());
+  await step('ssh', () => shutdownSshPool());
   process.exit(0);
 }
+const SHUTDOWN_DEADLINE_MS = 15_000;
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
 
@@ -1659,8 +1741,19 @@ process.on('unhandledRejection', (reason) => {
     stack: reason instanceof Error ? reason.stack : undefined,
   });
 });
+// A log call that fails inside this handler must not throw again:
+// re-entry would loop (2026-11-10, see fileLogStopped in logger.ts).
+let reportingUncaught = false;
 process.on('uncaughtException', (err) => {
-  logger.error({ msg: 'process.uncaught_exception', err: err.message, stack: err.stack });
+  if (reportingUncaught) return;
+  reportingUncaught = true;
+  try {
+    logger.error({ msg: 'process.uncaught_exception', err: err.message, stack: err.stack });
+  } catch {
+    /* the log itself is broken — nothing more to do here */
+  } finally {
+    reportingUncaught = false;
+  }
 });
 
 // SOMORA_DUMP_ROUTES=<file>: write every registered route (method, path,

@@ -42,12 +42,11 @@ export const BUILDER_SHORT_DESCRIPTIONS: Readonly<Record<string, string>> = {
   process: 'Manage background exec jobs: list, poll, log (tail), write (stdin), kill.',
   todo_write:
     'Replace the task list of this session (the person sees it live). Items: content, status (pending | ' +
-    'in_progress | completed | cancelled), priority. Exactly one in_progress at a time: set it the moment ' +
-    'you start an item, mark the item completed in the round it is verified — one at a time, never a ' +
-    'batch at the end. If blocked, keep it in_progress and add a follow-up naming the blocker.',
+    'in_progress | completed | cancelled), priority. Mark an item completed when it is done and checked.',
   ask_user:
     'Ask the person watching a question with 2-6 options (free text is always possible). Waits for the ' +
-    'answer or a timeout; returns {answered, answers, text}. Only for a real fork you cannot decide yourself.',
+    'answer or a timeout; returns {answered, answers, text}. Only for a real fork you cannot decide yourself. ' +
+    'Content they approve or pick goes in full into details.',
   plan_write: 'Write the plan file of this session (Markdown; replaces the file). The only write allowed in the plan phase.',
   acceptance_write:
     'Keep the acceptance list: one item per requirement of the order (id A01…, its words), status open | ' +

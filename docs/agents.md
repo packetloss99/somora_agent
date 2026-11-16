@@ -730,7 +730,7 @@ How the fallback chain works:
 | `steering` | boolean | `false` | Default for a message typed in the web client while a turn runs. `true` hands it into the running turn before its next step. `false` queues it as its own turn. The toggle next to Send flips it per message. Steering works on every engine: `openai-compatible`, `claude-cli`, `codex-cli` and `grok-cli`. |
 | `imageReview` | `never`, `always` | `never` | `always` feeds each generated image back to the agent so it can judge it, about 2k tokens per image. Not a lock: the agent can set `return_image` per call either way. |
 | `agentLoop.maxRounds` | integer | server value (8) | Rounds per turn on the `openai-compatible` engine. Builders have none unless set. |
-| `agentLoop.maxToolCallsPerTurn` | integer | server value (30) | Tool calls per turn, across all rounds. Builders default to 2000. |
+| `agentLoop.maxToolCallsPerTurn` | integer | server value (30) | Tool calls per turn, across all rounds. Builders default to 2000. A hard limit: calls in a reply beyond it are refused, not run, and the model is asked to answer. |
 | `agentLoop.maxTurnMs` | integer | none | Time limit per turn in milliseconds. Builders default to 8 hours. |
 
 ### Workspace and visibility
@@ -813,6 +813,8 @@ an `openai-compatible` provider.
 | `fallback.retryUnavailableMinutes` | `60` | How long an unreachable model is skipped. 1 to 1440. |
 | `agentLoop.maxRounds` | `8` | Rounds per turn, `openai-compatible` engine. |
 | `agentLoop.maxToolCallsPerTurn` | `30` | Tool calls per turn. |
+| `agentLoop.maxParallelTools` | `8` | Calls of one reply that run at the same time, for tools that change nothing. See [Tools](tools.md#results-limits-and-timeouts). |
+| `agentLoop.parallelToolHint` | `false` | Tells a model with `parallelToolCalls: true` that independent calls can go in one reply. |
 | `agentLoop.longTaskDefaultTimeoutMs` | `300000` | Default wait of `agent_ask` and the result tools. |
 | `agentLoop.longTaskMaxTimeoutMs` | `1800000` | Longest wait. |
 | `agentLoop.wakeGraceMs` | `3000` | Delay before a wake turn. 0 to 60000. |

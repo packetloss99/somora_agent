@@ -98,6 +98,19 @@ show it. A script an agent writes reads it with `somora key`. The
 exception is a command or tmux session started with
 `inherit_agent_env: true`, which passes it through.
 
+Secrets stay off command lines, which every user of the machine can
+read with `ps`. Claude Code starts somora's tool server with an
+environment that it puts on its own command line, so that environment
+leaves out the key, everything from `somora.env` and every variable whose
+name looks like a secret (`KEY`, `TOKEN`, `SECRET`, `PASSWORD` and
+similar).
+
+The tool server gets the full environment from
+`~/.somora/run/mcp-child-env.json`, which only your user can read. An
+external agent started on this machine gets the server's environment
+without the key, without those secrets and without somora's own
+variables.
+
 Ten wrong keys from one address within five minutes block that address
 for a minute. The server's own machine is never blocked.
 
@@ -244,7 +257,9 @@ name that changes its answer is refused too.
 Redirects are followed one hop at a time, each checked before anything
 is sent to it, at most five. To let agents read an internal page, list its host, IP or IPv4 range in
 `web.fetchAllowPrivate`. A `*.example.lan` entry covers every name
-under that domain.
+under that domain. The names `localhost`, `*.localhost` and the Docker
+host names stay blocked even when listed; list `127.0.0.1` to allow this
+machine.
 
 The browser tools are off by default (`browser.enabled`). When on, they
 block private networks unless a host or range is listed in

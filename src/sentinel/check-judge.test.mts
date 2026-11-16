@@ -25,6 +25,18 @@ let mode: 'ok' | 'down' | 'flaky' = 'ok';
 let inflight = 0;
 let maxInflight = 0;
 let delayMs = 0;
+/** A held model call: the test learns the call arrived (`called`) and
+ *  lets it answer (`release`) — no fixed sleeps that a busy machine
+ *  outruns. */
+let gate: { onCall: () => void; released: Promise<void> } | null = null;
+function holdModel(): { called: Promise<void>; release: () => void } {
+  let onCall!: () => void;
+  let release!: () => void;
+  const called = new Promise<void>((r) => (onCall = r));
+  const released = new Promise<void>((r) => (release = r));
+  gate = { onCall, released };
+  return { called, release: () => { gate = null; release(); } };
+}
 const fake = createServer((req, res) => {
   let raw = '';
   req.on('data', (d) => (raw += d)).on('end', () => {
@@ -37,10 +49,15 @@ const fake = createServer((req, res) => {
     inflight++;
     maxInflight = Math.max(maxInflight, inflight);
     const urgent = JSON.stringify(body.state).includes('tonight');
-    setTimeout(() => {
+    const answer = () => {
       inflight--;
       json(res, 200, { model: 'clef', answers: { urgent: { type: 'noul', noul: urgent ? 0.93 : 0.08 } }, usage: { input_tokens: 30, output_tokens: 0 } });
-    }, delayMs);
+    };
+    if (gate) {
+      const g = gate;
+      g.onCall();
+      void g.released.then(answer);
+    } else setTimeout(answer, delayMs);
   });
 });
 await new Promise<void>((r) => fake.listen(0, '127.0.0.1', r));
@@ -237,12 +254,12 @@ test('a trigger deleted while its items are judged stays deleted and wakes nobod
   await saveTrigger({ ...t, source: { ...(t.source as object), mode: 'once', deadline: new Date(Date.now() + 3_600_000).toISOString() } as Trigger['source'] });
   const h = harness(() => withModel);
   writeFileSync(mails, JSON.stringify([m(1, 'pay by tonight')]));
-  delayMs = 300;
+  const held = holdModel();
   const run = check('mail-del', h.deps, 0);
-  await new Promise((r) => setTimeout(r, 150)); // the model is answering now
+  await held.called; // the model is answering now
   await deleteTrigger('mail-del');
+  held.release();
   await run;
-  delayMs = 0;
   assert.equal(h.wakes.length, 0, 'no wake for a deleted trigger');
   assert.equal(getTrigger('mail-del') ?? null, null, 'not saved back as completed');
 });
@@ -253,13 +270,13 @@ test('a trigger changed while judging keeps its fresh start', async () => {
   const h = harness(() => withModel);
   await check('mail-upd', h.deps, 0); // starting items (none)
   writeFileSync(mails, JSON.stringify([m(1, 'pay by tonight')]));
-  delayMs = 300;
+  const held = holdModel();
   const run = check('mail-upd', h.deps, 5);
-  await new Promise((r) => setTimeout(r, 150));
+  await held.called;
   const t = getTrigger('mail-upd')!;
   await saveTrigger({ ...t, source: { ...(t.source as object), interval: '10m' } as Trigger['source'] });
+  held.release();
   await run;
-  delayMs = 0;
   assert.equal(h.wakes.length, 0);
   assert.equal((await loadCheckState('mail-upd'))!.seenItems?.['id:1'], undefined, 'the old run saved nothing');
 });
@@ -310,4 +327,14 @@ test('dry run, item by item: a script that reports final failed says so', async 
   const r = await dryRunCheck({ agent: 'ada', source: { mode: 'watch' }, evaluator: { type: 'decision', questions, wake: { question: 'urgent', minProbability: 0.8 }, perItem: true }, config: withModel, scriptPath: path });
   assert.match(r.verdict, /final: "failed"/);
   assert.equal(r.items, undefined);
+});
+
+// The ring keeps every fire of the current day, so the daily cap (500)
+// can be reached at all (Fable review 2026-11-10 Nr. 15).
+test('rotation keeps today\'s fires beyond the ring size', () => {
+  const day = Date.parse('2026-11-10T00:00:00Z');
+  const lines = [...Array(450).keys()].map((i) => JSON.stringify({ firedAt: new Date(day + i * 60_000).toISOString(), outcome: 'success' }));
+  const old = [...Array(100).keys()].map((i) => JSON.stringify({ firedAt: new Date(day - 86_400_000 + i).toISOString(), outcome: 'success' }));
+  const kept = keepNewest([...old, ...lines], 200, day);
+  assert.equal(kept.length, 450, 'all of today, none of yesterday beyond the ring');
 });
